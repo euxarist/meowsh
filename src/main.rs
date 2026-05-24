@@ -7,6 +7,7 @@ use meowsh::shell::{shell_init, SHELL};
 use meowsh::types::OPT_INTERACTIVE;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::Path;
 
 fn main() {
@@ -36,6 +37,7 @@ fn main() {
     SHELL.shell.lock().unwrap().login_shell = login_shell;
 
     if interactive {
+        init_interactive_job_control();
         SHELL.shell.lock().unwrap().opts |= OPT_INTERACTIVE;
     }
 
@@ -61,6 +63,32 @@ fn main() {
         run_interactive();
     } else {
         run_noninteractive();
+    }
+}
+
+fn init_interactive_job_control() {
+    unsafe {
+        if isatty(0) == 0 {
+            return;
+        }
+
+        let pid = libc::getpid();
+        if libc::setpgid(pid, pid) != 0 {
+            eprintln!(
+                "meowsh: warning: failed to set shell process group: {}",
+                io::Error::last_os_error()
+            );
+        }
+        let pgid = libc::getpgrp();
+        if libc::tcsetpgrp(0, pgid) != 0 {
+            eprintln!(
+                "meowsh: warning: failed to take terminal control: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let mut shell = SHELL.shell.lock().unwrap();
+        shell.shell_pgid = pgid;
     }
 }
 
@@ -96,11 +124,32 @@ fn source_file_silent(path: &str) {
     let Ok(content) = fs::read_to_string(path) else {
         return;
     };
+    let content = filter_startup_content(&content);
     let mut lexer = Lexer::new(&content);
     let mut parser = Parser::new(&mut lexer);
     while let Some(node) = parser.parse() {
         exec_node(&node);
     }
+}
+
+fn filter_startup_content(content: &str) -> String {
+    let mut filtered = String::with_capacity(content.len());
+    for line in content.lines() {
+        if !is_unsupported_zsh_framework_source(line) {
+            filtered.push_str(line);
+            filtered.push('\n');
+        }
+    }
+    filtered
+}
+
+fn is_unsupported_zsh_framework_source(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    let is_source = trimmed.starts_with("source ") || trimmed.starts_with(". ");
+    is_source && trimmed.contains("oh-my-zsh.sh")
 }
 
 fn parse_args(args: &[String]) -> (Option<bool>, Option<String>) {

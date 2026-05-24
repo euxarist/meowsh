@@ -117,6 +117,38 @@ EOF
 }
 
 #[test]
+fn test_redirection_restores_stdout() {
+    let temp_dir = TempDir::new().unwrap();
+    let out_path = temp_dir.path().join("out.txt");
+    let script = format!(
+        r#"
+        echo redirected > "{}"
+        echo visible
+        "#,
+        out_path.display()
+    );
+
+    let (status, stdout, _) = run_script(&script);
+    assert_eq!(status, 0);
+    assert_eq!(fs::read_to_string(out_path).unwrap().trim(), "redirected");
+    assert_eq!(stdout.trim(), "visible");
+}
+
+#[test]
+fn test_comments_are_ignored_after_whitespace() {
+    let script = r#"
+        # startup-style comment
+        echo before # trailing comment
+        echo foo#bar
+    "#;
+
+    let (status, stdout, stderr) = run_script(script);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["before", "foo#bar"]);
+    assert!(!stderr.contains("command not found"));
+}
+
+#[test]
 fn test_parameter_expansion_remove_suffix() {
     let script = r#"
         set -f
@@ -384,6 +416,86 @@ fn test_zshrc_sourced_when_interactive() {
         .expect("Failed to spawn meowsh");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert_eq!(stdout.trim(), "zshrc_value");
+}
+
+#[test]
+fn test_zshrc_skips_oh_my_zsh_bootstrap() {
+    let temp_dir = TempDir::new().unwrap();
+    let omz_dir = temp_dir.path().join(".oh-my-zsh");
+    fs::create_dir(&omz_dir).unwrap();
+    fs::write(
+        omz_dir.join("oh-my-zsh.sh"),
+        "echo should_not_source_oh_my_zsh\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join(".zshrc"),
+        r#"
+        export ZSH="$HOME/.oh-my-zsh"
+        source $ZSH/oh-my-zsh.sh
+        echo startup_continued
+        "#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("HOME", temp_dir.path())
+        .arg("-i")
+        .arg("-c")
+        .arg("echo command_ran")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("Failed to spawn meowsh");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(stdout.contains("startup_continued"));
+    assert!(stdout.contains("command_ran"));
+    assert!(!stdout.contains("should_not_source_oh_my_zsh"));
+    assert!(!stderr.contains("command not found"));
+}
+
+#[test]
+fn test_zshrc_skips_zsh_completion_scripts() {
+    let temp_dir = TempDir::new().unwrap();
+    let completion_path = temp_dir.path().join("_tool");
+    fs::write(
+        &completion_path,
+        "#compdef tool\necho should_not_source_completion\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join(".zshrc"),
+        format!(
+            r#"
+            [ -s "{}" ] && source "{}"
+            echo startup_continued
+            "#,
+            completion_path.display(),
+            completion_path.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("HOME", temp_dir.path())
+        .arg("-i")
+        .arg("-c")
+        .arg("echo command_ran")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("Failed to spawn meowsh");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(stdout.contains("startup_continued"));
+    assert!(stdout.contains("command_ran"));
+    assert!(!stdout.contains("should_not_source_completion"));
+    assert!(!stderr.contains("command not found"));
 }
 
 // ---- Phase 2A: arrays + parameter substitution + stubs ------------------

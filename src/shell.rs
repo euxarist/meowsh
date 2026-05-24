@@ -32,6 +32,7 @@ pub static SHELL: LazyLock<ShellState> = LazyLock::new(ShellState::new);
 pub fn shell_init() {
     let mut shell = SHELL.shell.lock().unwrap();
     shell.shell_pid = std::process::id() as i32;
+    shell.shell_pgid = unsafe { libc::getpgrp() };
     shell.last_status = 0;
     *shell.next_job_id.lock().unwrap() = 1;
 
@@ -80,7 +81,7 @@ pub fn shell_init() {
     shell.vars.insert(
         "PS1".to_string(),
         Var {
-            value: "meowsh> ".to_string(),
+            value: get_env("PS1", ""),
             flags: 0,
         },
     );
@@ -629,6 +630,22 @@ mod tests {
         shell_init();
         let s = expand_prompt("%{\x1b[31m%}red%{\x1b[0m%}");
         assert_eq!(s, "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn test_build_prompt_uses_cat_fallback_without_ps1() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        shell_init();
+        var_set("PS1", "", false);
+        var_set("PROMPT", "", false);
+        var_set("USER", "alice", false);
+        var_set("HOME", "/home/alice", false);
+        var_set("PWD", "/home/alice/projects", false);
+
+        let s = build_prompt();
+        assert!(s.contains("alice"));
+        assert!(s.contains("~/projects"));
+        assert!(s.contains("𓃠"));
     }
 
     #[test]
