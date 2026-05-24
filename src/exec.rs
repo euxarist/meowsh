@@ -191,9 +191,9 @@ fn handle_redirections(redirs: &[Redir]) -> Option<SavedFds> {
         return None;
     }
 
-    let stdin_fd = unsafe { OwnedFd::from_raw_fd(0) };
-    let stdout_fd = unsafe { OwnedFd::from_raw_fd(1) };
-    let stderr_fd = unsafe { OwnedFd::from_raw_fd(2) };
+    let stdin_fd = dup_fd(0)?;
+    let stdout_fd = dup_fd(1)?;
+    let stderr_fd = dup_fd(2)?;
 
     for redir in redirs {
         let target = expand_all(&redir.file);
@@ -279,10 +279,25 @@ fn handle_redirections(redirs: &[Redir]) -> Option<SavedFds> {
 fn restore_fds(saved: Option<SavedFds>) {
     if let Some(fds) = saved {
         unsafe {
-            libc::dup2(fds.stdin.into_raw_fd(), 0);
-            libc::dup2(fds.stdout.into_raw_fd(), 1);
-            libc::dup2(fds.stderr.into_raw_fd(), 2);
+            let stdin = fds.stdin.into_raw_fd();
+            let stdout = fds.stdout.into_raw_fd();
+            let stderr = fds.stderr.into_raw_fd();
+            libc::dup2(stdin, 0);
+            libc::dup2(stdout, 1);
+            libc::dup2(stderr, 2);
+            libc::close(stdin);
+            libc::close(stdout);
+            libc::close(stderr);
         }
+    }
+}
+
+fn dup_fd(fd: i32) -> Option<OwnedFd> {
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        None
+    } else {
+        Some(unsafe { OwnedFd::from_raw_fd(duped) })
     }
 }
 
@@ -380,6 +395,17 @@ fn exec_command(args: &[String], foreground: bool) -> i32 {
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            Ok(())
+        });
+    }
 
     match cmd.spawn() {
         Ok(child) => {
@@ -827,6 +853,9 @@ fn builtin_source(args: &[String]) -> i32 {
 
     match fs::read_to_string(&filename) {
         Ok(content) => {
+            if is_zsh_completion_script(&content) {
+                return 0;
+            }
             let mut lexer = Lexer::new(&content);
             let mut parser = Parser::new(&mut lexer);
             while let Some(node) = parser.parse() {
@@ -839,6 +868,17 @@ fn builtin_source(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn is_zsh_completion_script(content: &str) -> bool {
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("#compdef") || trimmed.starts_with("#autoload")
+        })
+        .unwrap_or(false)
 }
 
 fn builtin_pwd(_args: &[String]) -> i32 {
@@ -1217,7 +1257,7 @@ fn builtin_umask(args: &[String]) -> i32 {
         println!("{:04o}", mask);
         return 0;
     }
-    let mask = u16::from_str_radix(&args[0], 8).unwrap_or(0) as u32;
+    let mask = u16::from_str_radix(&args[0], 8).unwrap_or(0) as libc::mode_t;
     unsafe { libc::umask(mask) };
     0
 }

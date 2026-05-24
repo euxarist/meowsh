@@ -36,6 +36,7 @@ fn main() {
     SHELL.shell.lock().unwrap().login_shell = login_shell;
 
     if interactive {
+        init_interactive_job_control();
         SHELL.shell.lock().unwrap().opts |= OPT_INTERACTIVE;
     }
 
@@ -61,6 +62,22 @@ fn main() {
         run_interactive();
     } else {
         run_noninteractive();
+    }
+}
+
+fn init_interactive_job_control() {
+    unsafe {
+        if isatty(0) == 0 {
+            return;
+        }
+
+        let pid = libc::getpid();
+        let _ = libc::setpgid(pid, pid);
+        let pgid = libc::getpgrp();
+        let _ = libc::tcsetpgrp(0, pgid);
+
+        let mut shell = SHELL.shell.lock().unwrap();
+        shell.shell_pgid = pgid;
     }
 }
 
@@ -96,11 +113,29 @@ fn source_file_silent(path: &str) {
     let Ok(content) = fs::read_to_string(path) else {
         return;
     };
+    let content = filter_startup_content(&content);
     let mut lexer = Lexer::new(&content);
     let mut parser = Parser::new(&mut lexer);
     while let Some(node) = parser.parse() {
         exec_node(&node);
     }
+}
+
+fn filter_startup_content(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| !is_unsupported_zsh_framework_source(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_unsupported_zsh_framework_source(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    let is_source = trimmed.starts_with("source ") || trimmed.starts_with(". ");
+    is_source && trimmed.contains("oh-my-zsh.sh")
 }
 
 fn parse_args(args: &[String]) -> (Option<bool>, Option<String>) {

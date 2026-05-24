@@ -72,7 +72,7 @@ impl Lexer {
             return self.next_token();
         }
 
-        if c == '#' && (self.pos == 0 || self.input[self.pos - 1..].starts_with('\n')) {
+        if c == '#' {
             while self.pos < self.input.len() && !self.input[self.pos..].starts_with('\n')
             {
                 self.pos += 1;
