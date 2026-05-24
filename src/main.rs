@@ -7,6 +7,7 @@ use meowsh::shell::{shell_init, SHELL};
 use meowsh::types::OPT_INTERACTIVE;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::Path;
 
 fn main() {
@@ -72,9 +73,19 @@ fn init_interactive_job_control() {
         }
 
         let pid = libc::getpid();
-        let _ = libc::setpgid(pid, pid);
+        if libc::setpgid(pid, pid) != 0 {
+            eprintln!(
+                "meowsh: warning: failed to set shell process group: {}",
+                io::Error::last_os_error()
+            );
+        }
         let pgid = libc::getpgrp();
-        let _ = libc::tcsetpgrp(0, pgid);
+        if libc::tcsetpgrp(0, pgid) != 0 {
+            eprintln!(
+                "meowsh: warning: failed to take terminal control: {}",
+                io::Error::last_os_error()
+            );
+        }
 
         let mut shell = SHELL.shell.lock().unwrap();
         shell.shell_pgid = pgid;
@@ -122,11 +133,14 @@ fn source_file_silent(path: &str) {
 }
 
 fn filter_startup_content(content: &str) -> String {
-    content
-        .lines()
-        .filter(|line| !is_unsupported_zsh_framework_source(line))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut filtered = String::with_capacity(content.len());
+    for line in content.lines() {
+        if !is_unsupported_zsh_framework_source(line) {
+            filtered.push_str(line);
+            filtered.push('\n');
+        }
+    }
+    filtered
 }
 
 fn is_unsupported_zsh_framework_source(line: &str) -> bool {
