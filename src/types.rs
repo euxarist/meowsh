@@ -112,6 +112,8 @@ pub struct Shell {
     pub assoc_arrays: HashMap<String, BTreeMap<String, String>>,
     // Arrays declared with `typeset -U` keep first occurrences only.
     pub unique_arrays: HashSet<String>,
+    // Directory stack used by pushd/popd/dirs.
+    pub dir_stack: Vec<String>,
 }
 
 impl Shell {
@@ -147,6 +149,7 @@ impl Shell {
             arrays: HashMap::new(),
             assoc_arrays: HashMap::new(),
             unique_arrays: HashSet::new(),
+            dir_stack: Vec::new(),
         }
     }
 }
