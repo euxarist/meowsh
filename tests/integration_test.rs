@@ -144,8 +144,31 @@ fn test_comments_are_ignored_after_whitespace() {
 
     let (status, stdout, stderr) = run_script(script);
     assert_eq!(status, 0);
-    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["before", "foo#bar"]);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["before", "foo#bar"]
+    );
     assert!(!stderr.contains("command not found"));
+}
+
+#[test]
+fn test_stderr_redirection_uses_requested_fd() {
+    let temp_dir = TempDir::new().unwrap();
+    let err_path = temp_dir.path().join("err.txt");
+    let script = format!(r#"/bin/sh -c 'echo err >&2' 2> "{}""#, err_path.display());
+    let (status, stdout, stderr) = run_script(&script);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "");
+    assert_eq!(stderr.trim(), "");
+    assert_eq!(fs::read_to_string(err_path).unwrap().trim(), "err");
+}
+
+#[test]
+fn test_fd_duplication_redirection() {
+    let (status, stdout, stderr) = run_script(r#"/bin/sh -c 'echo err >&2' 2>&1"#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "err");
+    assert_eq!(stderr.trim(), "");
 }
 
 #[test]
@@ -276,7 +299,7 @@ fn test_history_limit() {
         script.push_str(&format!("echo cmd{}\n", i));
     }
     script.push_str("history\n");
-    
+
     let (status, stdout, _) = run_script(&script);
     assert_eq!(status, 0);
     // cmd0 should have been rotated out as we have 2000 commands and limit is 1000
@@ -352,9 +375,7 @@ fn test_posix_function_def() {
 
 #[test]
 fn test_posix_function_multiline() {
-    let (status, stdout, _) = run_script(
-        "greet() {\n  echo line1\n  echo line2\n}\ngreet",
-    );
+    let (status, stdout, _) = run_script("greet() {\n  echo line1\n  echo line2\n}\ngreet");
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "line1\nline2");
 }
@@ -368,8 +389,7 @@ fn test_setopt_errexit_named() {
 
 #[test]
 fn test_setopt_unknown_does_not_error() {
-    let (status, stdout, _) =
-        run_script("setopt extendedglob nomatch hist_ignore_dups; echo done");
+    let (status, stdout, _) = run_script("setopt extendedglob nomatch hist_ignore_dups; echo done");
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "done");
 }
@@ -377,8 +397,7 @@ fn test_setopt_unknown_does_not_error() {
 #[test]
 fn test_unsetopt_clears_legacy_flag() {
     // setopt errexit then unsetopt — `false` should NOT cause exit
-    let (status, stdout, _) =
-        run_script("setopt errexit; unsetopt errexit; false; echo reached");
+    let (status, stdout, _) = run_script("setopt errexit; unsetopt errexit; false; echo reached");
     assert_eq!(status, 0);
     assert!(stdout.contains("reached"));
 }
@@ -509,16 +528,14 @@ fn test_array_assign_and_join() {
 
 #[test]
 fn test_array_index_one_based() {
-    let (status, stdout, _) =
-        run_script(r#"arr=(alpha beta gamma); echo "${arr[1]} ${arr[3]}""#);
+    let (status, stdout, _) = run_script(r#"arr=(alpha beta gamma); echo "${arr[1]} ${arr[3]}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "alpha gamma");
 }
 
 #[test]
 fn test_array_at_splat() {
-    let (status, stdout, _) =
-        run_script(r#"arr=(a b c); echo "${arr[@]}"; echo "${arr[*]}""#);
+    let (status, stdout, _) = run_script(r#"arr=(a b c); echo "${arr[@]}"; echo "${arr[*]}""#);
     assert_eq!(status, 0);
     let lines: Vec<&str> = stdout.trim().split('\n').collect();
     assert_eq!(lines, vec!["a b c", "a b c"]);
@@ -526,90 +543,116 @@ fn test_array_at_splat() {
 
 #[test]
 fn test_array_length() {
-    let (status, stdout, _) =
-        run_script(r#"arr=(one two three four); echo "${#arr[@]}""#);
+    let (status, stdout, _) = run_script(r#"arr=(one two three four); echo "${#arr[@]}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "4");
 }
 
 #[test]
 fn test_array_append() {
-    let (status, stdout, _) =
-        run_script(r#"arr=(a b); arr+=(c d); echo "${arr[@]}""#);
+    let (status, stdout, _) = run_script(r#"arr=(a b); arr+=(c d); echo "${arr[@]}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "a b c d");
 }
 
 #[test]
 fn test_array_with_var_expansion_in_literal() {
-    let (status, stdout, _) =
-        run_script(r#"x=hello; arr=($x world); echo "${arr[1]}-${arr[2]}""#);
+    let (status, stdout, _) = run_script(r#"x=hello; arr=($x world); echo "${arr[1]}-${arr[2]}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "hello-world");
 }
 
 #[test]
 fn test_array_negative_index() {
-    let (status, stdout, _) =
-        run_script(r#"arr=(red green blue); echo "${arr[-1]} ${arr[-2]}""#);
+    let (status, stdout, _) = run_script(r#"arr=(red green blue); echo "${arr[-1]} ${arr[-2]}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "blue green");
 }
 
 #[test]
 fn test_subst_first_match() {
-    let (status, stdout, _) =
-        run_script(r#"v=aXbXc; echo "${v/X/_}""#);
+    let (status, stdout, _) = run_script(r#"v=aXbXc; echo "${v/X/_}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "a_bXc");
 }
 
 #[test]
 fn test_subst_global() {
-    let (status, stdout, _) =
-        run_script(r#"v=aXbXc; echo "${v//X/_}""#);
+    let (status, stdout, _) = run_script(r#"v=aXbXc; echo "${v//X/_}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "a_b_c");
 }
 
 #[test]
 fn test_subst_path_separator() {
-    let (status, stdout, _) =
-        run_script(r#"p=/usr/local/bin; echo "${p//\//.}""#);
+    let (status, stdout, _) = run_script(r#"p=/usr/local/bin; echo "${p//\//.}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), ".usr.local.bin");
 }
 
 #[test]
 fn test_subst_anchor_start() {
-    let (status, stdout, _) =
-        run_script(r#"v=foofoo; echo "${v/#foo/bar}""#);
+    let (status, stdout, _) = run_script(r#"v=foofoo; echo "${v/#foo/bar}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "barfoo");
 }
 
 #[test]
 fn test_subst_anchor_end() {
-    let (status, stdout, _) =
-        run_script(r#"v=foofoo; echo "${v/%foo/bar}""#);
+    let (status, stdout, _) = run_script(r#"v=foofoo; echo "${v/%foo/bar}""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "foobar");
 }
 
 #[test]
 fn test_scalar_append() {
-    let (status, stdout, _) =
-        run_script(r#"x=hello; x+=" world"; echo "$x""#);
+    let (status, stdout, _) = run_script(r#"x=hello; x+=" world"; echo "$x""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "hello world");
 }
 
 #[test]
-fn test_zstyle_stub_no_error() {
-    let (status, stdout, _) =
-        run_script(r#"zstyle ':completion:*' menu select; echo done"#);
+fn test_zstyle_stores_and_reads_scalar() {
+    let (status, stdout, _) = run_script(
+        r#"zstyle ':completion:*' menu select; zstyle -s ':completion::complete:' menu result; echo "$result""#,
+    );
     assert_eq!(status, 0);
-    assert_eq!(stdout.trim(), "done");
+    assert_eq!(stdout.trim(), "select");
+}
+
+#[test]
+fn test_zstyle_reads_array_values() {
+    let (status, stdout, _) = run_script(
+        r#"zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}' '+r:|[._-]=** r:|=**'; zstyle -a ':completion:*' matcher-list matchers; echo "${#matchers[@]}"; echo "${matchers[1]}""#,
+    );
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["2", "m:{a-z}={A-Za-z}"]);
+}
+
+#[test]
+fn test_zstyle_boolean_query() {
+    let (status, stdout, _) = run_script(
+        r#"zstyle ':completion:*' auto-description yes; zstyle -b ':completion:*' auto-description enabled; echo "$enabled""#,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "yes");
+}
+
+#[test]
+fn test_zstyle_later_match_overrides_earlier() {
+    let (status, stdout, _) = run_script(
+        r#"zstyle ':completion:*' menu select; zstyle ':completion::complete:*' menu no; zstyle -s ':completion::complete:foo' menu result; echo "$result""#,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "no");
+}
+
+#[test]
+fn test_zstyle_list_styles() {
+    let (status, stdout, _) = run_script(r#"zstyle ':completion:*' menu select; zstyle -L"#);
+    assert_eq!(status, 0);
+    assert!(stdout.contains("zstyle :completion:* menu select"));
 }
 
 #[test]
@@ -623,20 +666,192 @@ fn test_compsys_stubs_no_error() {
 
 #[test]
 fn test_add_zsh_hook_stub_no_error() {
-    let (status, stdout, _) =
-        run_script(r#"add-zsh-hook precmd my_hook; echo done"#);
+    let (status, stdout, _) = run_script(r#"add-zsh-hook precmd my_hook; echo done"#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "done");
 }
 
 #[test]
 fn test_for_loop_over_array() {
-    let (status, stdout, _) = run_script(
-        r#"arr=(a b c); for x in "${arr[@]}"; do echo "got $x"; done"#,
-    );
+    let (status, stdout, _) =
+        run_script(r#"arr=(a b c); for x in "${arr[@]}"; do echo "got $x"; done"#);
     assert_eq!(status, 0);
     let lines: Vec<&str> = stdout.trim().split('\n').collect();
     assert_eq!(lines, vec!["got a", "got b", "got c"]);
+}
+
+#[test]
+fn test_posix_null_command() {
+    let (status, stdout, _) = run_script(r#": ignored args; echo ok"#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "ok");
+}
+
+#[test]
+fn test_posix_adjacent_parameter_expansion() {
+    let (status, stdout, _) = run_script(r#"left=meow; right=sh; echo "$left$right""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "meowsh");
+}
+
+#[test]
+fn test_posix_break_exits_loop() {
+    let (status, stdout, _) =
+        run_script(r#"for x in 1 2 3 4; do if [ "$x" -eq 3 ]; then break; fi; echo "$x"; done"#);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["1", "2"]);
+}
+
+#[test]
+fn test_posix_continue_skips_loop_body() {
+    let (status, stdout, _) =
+        run_script(r#"for x in 1 2 3; do if [ "$x" -eq 2 ]; then continue; fi; echo "$x"; done"#);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["1", "3"]);
+}
+
+#[test]
+fn test_posix_break_nested_count() {
+    let (status, stdout, _) = run_script(
+        r#"for outer in a b; do for inner in 1 2; do echo "$outer$inner"; break 2; done; echo after; done"#,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "a1");
+}
+
+#[test]
+fn test_posix_continue_nested_count() {
+    let (status, stdout, _) = run_script(
+        r#"for outer in a b; do echo "outer-$outer"; for inner in 1 2; do continue 2; done; echo never; done"#,
+    );
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["outer-a", "outer-b"]);
+}
+
+#[test]
+fn test_posix_set_sets_positional_parameters() {
+    let (status, stdout, _) = run_script(r#"set -- alpha beta gamma; echo "$#:$1:$2:$3""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "3:alpha:beta:gamma");
+}
+
+#[test]
+fn test_posix_set_options_then_positional_parameters() {
+    let (status, stdout, stderr) = run_script(r#"set -x alpha beta; echo "$1:$2" 2>/dev/null"#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "alpha:beta");
+    assert!(stderr.contains("+ echo alpha:beta"));
+}
+
+#[test]
+fn test_posix_shift_count() {
+    let (status, stdout, _) = run_script(r#"set -- a b c d; shift 2; echo "$#:$1:$2""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "2:c:d");
+}
+
+#[test]
+fn test_posix_shift_too_many_fails() {
+    let (status, stdout, stderr) = run_script(r#"set -- a; shift 2; echo "status=$? count=$#""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1 count=1");
+    assert!(stderr.contains("can't shift that many"));
+}
+
+#[test]
+fn test_posix_readonly_rejects_reassignment() {
+    let (status, stdout, stderr) =
+        run_script(r#"readonly answer=42; answer=99; echo "status=$? answer=$answer""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1 answer=42");
+    assert!(stderr.contains("readonly variable"));
+}
+
+#[test]
+fn test_posix_readonly_rejects_second_readonly_assignment() {
+    let (status, stdout, stderr) =
+        run_script(r#"readonly answer=42; readonly answer=99; echo "status=$? answer=$answer""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1 answer=42");
+    assert!(stderr.contains("readonly variable"));
+}
+
+#[test]
+fn test_typeset_export_assignment() {
+    let (status, stdout, _) =
+        run_script(r#"typeset -gx MEOWSH_TYPED=works; sh -c 'printf "%s" "$MEOWSH_TYPED"'"#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout, "works");
+}
+
+#[test]
+fn test_path_array_tracks_path_scalar() {
+    let (status, stdout, _) =
+        run_script(r#"PATH=/bin; path=(/tmp $path); echo "${path[@]}"; echo "$PATH""#);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["/tmp /bin", "/tmp:/bin"]);
+}
+
+#[test]
+fn test_typeset_unique_array_deduplicates_path() {
+    let (status, stdout, _) = run_script(
+        r#"typeset -U path; path=(/bin /usr/bin /bin /sbin /usr/bin); echo "${path[@]}"; echo "$PATH""#,
+    );
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["/bin /usr/bin /sbin", "/bin:/usr/bin:/sbin"]);
+}
+
+#[test]
+fn test_typeset_associative_array_key_lookup() {
+    let (status, stdout, _) = run_script(
+        r#"typeset -A colors; colors=(red 31 green 32); echo "${colors[red]} ${colors[green]}""#,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "31 32");
+}
+
+#[test]
+fn test_associative_array_key_and_value_expansion() {
+    let (status, stdout, _) = run_script(
+        r#"typeset -A colors; colors=(red 31 green 32); echo "${(k)colors}"; echo "${(v)colors}"; echo "${#colors[@]}""#,
+    );
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["green red", "32 31", "2"]);
+}
+
+#[test]
+fn test_associative_array_subscript_assignment() {
+    let (status, stdout, _) = run_script(
+        r#"typeset -A colors; colors[blue]=34; colors[green]=32; echo "${colors[blue]} ${colors[green]}"; echo "${#colors[@]}""#,
+    );
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["34 32", "2"]);
+}
+
+#[test]
+fn test_associative_array_subscript_append() {
+    let (status, stdout, _) = run_script(
+        r#"typeset -A names; names[prefix]=meow; names[prefix]+=sh; echo "${names[prefix]}""#,
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "meowsh");
+}
+
+#[test]
+fn test_indexed_array_subscript_assignment_updates_path() {
+    let (status, stdout, _) = run_script(
+        r#"PATH=/bin:/usr/bin; path[1]=/tmp; path[3]=/sbin; echo "${path[@]}"; echo "$PATH""#,
+    );
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["/tmp /usr/bin /sbin", "/tmp:/usr/bin:/sbin"]);
 }
 
 #[test]

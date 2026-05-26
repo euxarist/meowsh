@@ -9,15 +9,33 @@ pub fn is_assignment(s: &str) -> bool {
         return false;
     }
     let bytes = s.as_bytes();
+    let mut bracket_depth = 0;
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b'=' {
+        if b == b'=' && bracket_depth == 0 {
             return i > 0;
         }
         // `name+=` form (zsh/bash append assignment).
-        if b == b'+' && bytes.get(i + 1) == Some(&b'=') {
+        if b == b'+' && bytes.get(i + 1) == Some(&b'=') && bracket_depth == 0 {
             return i > 0;
         }
         let c = b as char;
+        if c == '[' {
+            if i == 0 {
+                return false;
+            }
+            bracket_depth += 1;
+            continue;
+        }
+        if c == ']' {
+            if bracket_depth == 0 {
+                return false;
+            }
+            bracket_depth -= 1;
+            continue;
+        }
+        if bracket_depth > 0 {
+            continue;
+        }
         if !c.is_alphabetic() && !c.is_ascii_digit() && b != b'_' {
             return false;
         }
@@ -73,8 +91,7 @@ impl Lexer {
         }
 
         if c == '#' {
-            while self.pos < self.input.len() && !self.input[self.pos..].starts_with('\n')
-            {
+            while self.pos < self.input.len() && !self.input[self.pos..].starts_with('\n') {
                 self.pos += 1;
             }
             return self.next_token();
@@ -280,9 +297,7 @@ impl Lexer {
 
             if c == '\'' {
                 self.pos += 1;
-                while self.pos < self.input.len()
-                    && !self.input[self.pos..].starts_with('\'')
-                {
+                while self.pos < self.input.len() && !self.input[self.pos..].starts_with('\'') {
                     self.pos += 1;
                 }
                 if self.pos < self.input.len() {
@@ -313,9 +328,7 @@ impl Lexer {
 
             if c == '`' {
                 self.pos += 1;
-                while self.pos < self.input.len()
-                    && !self.input[self.pos..].starts_with('`')
-                {
+                while self.pos < self.input.len() && !self.input[self.pos..].starts_with('`') {
                     self.pos += 1;
                 }
                 if self.pos < self.input.len() {
@@ -330,9 +343,7 @@ impl Lexer {
                     let nc = self.input[self.pos..].chars().next().unwrap();
                     if nc == '(' {
                         self.pos += 1;
-                        if self.pos < self.input.len()
-                            && self.input[self.pos..].starts_with('(')
-                        {
+                        if self.pos < self.input.len() && self.input[self.pos..].starts_with('(') {
                             self.pos += 1;
                             let mut depth = 1;
                             while self.pos < self.input.len() && depth > 0 {
@@ -347,11 +358,11 @@ impl Lexer {
                                     }
                                 } else if ch == ')'
                                     && self.pos < self.input.len()
-                                        && self.input[self.pos..].starts_with(')')
-                                    {
-                                        self.pos += 1;
-                                        depth -= 1;
-                                    }
+                                    && self.input[self.pos..].starts_with(')')
+                                {
+                                    self.pos += 1;
+                                    depth -= 1;
+                                }
                             }
                             continue;
                         }

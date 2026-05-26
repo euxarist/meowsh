@@ -41,8 +41,8 @@ impl MeowshHelper {
         let parts: Vec<&str> = line.split_whitespace().collect();
         // Command position: empty line, single word without '/', or after a pipe/operator
         let trailing_space = line.ends_with(' ') || line.ends_with('\t');
-        let is_cmd_position = parts.is_empty()
-            || (parts.len() == 1 && !trailing_space && !parts[0].contains('/'));
+        let is_cmd_position =
+            parts.is_empty() || (parts.len() == 1 && !trailing_space && !parts[0].contains('/'));
 
         if is_cmd_position {
             let current = parts.last().unwrap_or(&"");
@@ -68,8 +68,8 @@ impl MeowshHelper {
             let builtins = [
                 "exit", "cd", "source", "pwd", "echo", "true", "false", "test", "[", "jobs", "fg",
                 "bg", "export", "set", "unset", "alias", "unalias", "read", "shift", "local",
-                "type", "kill", "wait", "umask", "return", "eval", "trap", "ulimit", "readonly",
-                "history",
+                "typeset", "declare", "type", "kill", "wait", "break", "continue", "umask",
+                "return", "eval", "trap", "ulimit", "readonly", "history",
             ];
             for b in builtins {
                 if self.fuzzy_match(current, b) {
@@ -117,7 +117,12 @@ impl MeowshHelper {
         completions
     }
 
-    fn complete_paths(&self, partial: &str, completions: &mut Vec<rustyline::completion::Pair>, dirs_only: bool) {
+    fn complete_paths(
+        &self,
+        partial: &str,
+        completions: &mut Vec<rustyline::completion::Pair>,
+        dirs_only: bool,
+    ) {
         use std::path::Path;
 
         // Expand ~ to home directory
@@ -184,10 +189,7 @@ impl MeowshHelper {
                 continue;
             }
 
-            let is_dir = entry
-                .file_type()
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
 
             if dirs_only && !is_dir {
                 continue;
@@ -220,11 +222,7 @@ impl MeowshHelper {
                 }
             };
 
-            let display = if is_dir {
-                format!("{}/", name)
-            } else {
-                name
-            };
+            let display = if is_dir { format!("{}/", name) } else { name };
 
             completions.push(rustyline::completion::Pair {
                 display,
@@ -262,7 +260,8 @@ fn get_char_or_ansi(s: &str) -> Vec<CharOrAnsi> {
             ansi.push(c);
             if let Some(&(_, next_c)) = chars.peek() {
                 match next_c {
-                    '[' => { // CSI
+                    '[' => {
+                        // CSI
                         let (_, c2) = chars.next().unwrap();
                         ansi.push(c2);
                         while let Some((_, c)) = chars.next() {
@@ -272,17 +271,20 @@ fn get_char_or_ansi(s: &str) -> Vec<CharOrAnsi> {
                             }
                         }
                     }
-                    ']' => { // OSC
+                    ']' => {
+                        // OSC
                         let (_, c2) = chars.next().unwrap();
                         ansi.push(c2);
                         while let Some((_, c)) = chars.next() {
                             ansi.push(c);
-                            if c == '\x07' { // BEL
+                            if c == '\x07' {
+                                // BEL
                                 break;
                             }
                             if c == '\x1b' {
                                 if let Some(&(_, next_next_c)) = chars.peek() {
-                                    if next_next_c == '\\' { // ST
+                                    if next_next_c == '\\' {
+                                        // ST
                                         let (_, c3) = chars.next().unwrap();
                                         ansi.push(c3);
                                         break;
@@ -291,7 +293,8 @@ fn get_char_or_ansi(s: &str) -> Vec<CharOrAnsi> {
                             }
                         }
                     }
-                    '(' | ')' | '#' | '*' | '+' | '-' | '.' | '/' => { // G0/G1 charset or other 2-char ESC
+                    '(' | ')' | '#' | '*' | '+' | '-' | '.' | '/' => {
+                        // G0/G1 charset or other 2-char ESC
                         let (_, c2) = chars.next().unwrap();
                         ansi.push(c2);
                         if let Some((_, c3)) = chars.next() {
@@ -563,12 +566,14 @@ impl Hinter for MeowshHelper {
         for hist in history.iter().rev() {
             let clean_hist = strip_ansi(hist);
             let lower_hist = clean_hist.to_lowercase();
-            if lower_hist.starts_with(&lower_input) && clean_hist.chars().count() > trimmed_input.chars().count() {
+            if lower_hist.starts_with(&lower_input)
+                && clean_hist.chars().count() > trimmed_input.chars().count()
+            {
                 // Return what's left of the history entry after the input
                 // We skip the number of characters in the input to get the hint suffix
                 let char_count = trimmed_input.chars().count();
                 let hint_text: String = clean_hist.chars().skip(char_count).collect();
-                
+
                 return Some(MeowshHint {
                     display: hint_text.clone(),
                     completion: hint_text, // hist is already clean
@@ -704,7 +709,7 @@ mod tests {
         let helper = MeowshHelper;
         let history = FileHistory::new();
         let ctx = rustyline::Context::new(&history);
-        
+
         // Case insensitive match and prefix match
         let hint = helper.hint("ec", 2, &ctx);
         assert!(hint.is_some());
@@ -738,11 +743,11 @@ mod tests {
     fn test_highlight_command() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let helper = MeowshHelper;
-        
+
         // Known builtin
         let h = helper.highlight("echo hello", 0);
         assert!(h.contains("\x1b[32mecho\x1b[0m"));
-        
+
         // Unknown command
         let h = helper.highlight("nonexistent_command", 0);
         assert!(h.contains("\x1b[31mnonexistent_command\x1b[0m"));
@@ -752,7 +757,7 @@ mod tests {
     fn test_highlight_operators() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let helper = MeowshHelper;
-        
+
         let h = helper.highlight("ls | grep foo && echo bar", 0);
         assert!(h.contains("\x1b[36m|\x1b[0m"));
         assert!(h.contains("\x1b[36m&&\x1b[0m"));
@@ -764,7 +769,7 @@ mod tests {
     fn test_highlight_strings() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let helper = MeowshHelper;
-        
+
         let h = helper.highlight("echo \"hello world\"", 0);
         assert!(h.contains("\x1b[33m\"hello world\"\x1b[0m"));
     }
@@ -773,7 +778,7 @@ mod tests {
     fn test_highlight_comments() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let helper = MeowshHelper;
-        
+
         let h = helper.highlight("# this is a comment", 0);
         assert!(h.contains("\x1b[90m# this is a comment\x1b[0m"));
     }
@@ -793,11 +798,11 @@ mod tests {
     fn test_fuzzy_completions() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let helper = MeowshHelper;
-        
+
         // Test builtins fuzzy matching
         let comps = helper.get_completions("eo");
         assert!(comps.iter().any(|c| c.display == "echo"));
-        
+
         let comps = helper.get_completions("rd");
         assert!(comps.iter().any(|c| c.display == "read"));
     }

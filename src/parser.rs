@@ -217,7 +217,7 @@ impl<'a> Parser<'a> {
         let mut node = ASTNode::new("simple");
 
         loop {
-            let tok = self.peek_token();
+            let mut tok = self.peek_token();
             if Self::is_terminator(&tok) {
                 break;
             }
@@ -226,6 +226,7 @@ impl<'a> Parser<'a> {
             if tok.token_type == TokenType::IoNumber {
                 let fd_str = self.lexer.next_token().value;
                 fd = fd_str.parse().unwrap_or(-1);
+                tok = self.peek_token();
             }
 
             if Self::is_redirection(&tok) {
@@ -259,21 +260,22 @@ impl<'a> Parser<'a> {
                     self.lexer.next_token();
                     let (name, value, is_append) = split_assignment(&raw);
 
+                    if let Some((base, subscript)) = split_assignment_subscript(&name) {
+                        node.subscript_assigns
+                            .push((base, subscript, value, is_append));
+                        continue;
+                    }
+
                     // Array literal / append: `name=(...)` or `name+=(...)`.
-                    if value.is_empty()
-                        && self.peek_token().token_type == TokenType::Lparen
-                    {
+                    if value.is_empty() && self.peek_token().token_type == TokenType::Lparen {
                         self.lexer.next_token(); // (
                         let mut items: Vec<String> = Vec::new();
                         loop {
                             let t = self.peek_token();
-                            if t.token_type == TokenType::Rparen
-                                || t.token_type == TokenType::Eof
-                            {
+                            if t.token_type == TokenType::Rparen || t.token_type == TokenType::Eof {
                                 break;
                             }
-                            if t.token_type == TokenType::Newline
-                                || t.token_type == TokenType::Semi
+                            if t.token_type == TokenType::Newline || t.token_type == TokenType::Semi
                             {
                                 self.lexer.next_token();
                                 continue;
@@ -548,4 +550,17 @@ fn split_assignment(raw: &str) -> (String, String, bool) {
         return (raw[..idx].to_string(), raw[idx + 1..].to_string(), false);
     }
     (raw.to_string(), String::new(), false)
+}
+
+fn split_assignment_subscript(name: &str) -> Option<(String, String)> {
+    let open = name.find('[')?;
+    if !name.ends_with(']') || open == 0 {
+        return None;
+    }
+    let base = &name[..open];
+    let subscript = &name[open + 1..name.len() - 1];
+    if base.is_empty() || subscript.is_empty() {
+        return None;
+    }
+    Some((base.to_string(), subscript.to_string()))
 }

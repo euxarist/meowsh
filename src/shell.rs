@@ -2,7 +2,7 @@ use crate::types::{
     Shell, Var, OPT_ALLEXPORT, OPT_ERREXIT, OPT_HASHALL, OPT_INTERACTIVE, OPT_MONITOR, OPT_NOEXEC,
     OPT_NOGLOB, OPT_NOUNSET, OPT_VERBOSE, OPT_XTRACE, VAR_EXPORT,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -106,6 +106,9 @@ pub fn shell_init() {
             .to_string_lossy()
             .to_string();
     }
+
+    seed_tied_array(&mut shell, "path", "PATH");
+    seed_tied_array(&mut shell, "fpath", "FPATH");
 }
 
 fn get_env(key: &str, def: &str) -> String {
@@ -178,6 +181,9 @@ pub fn var_get(name: &str) -> String {
     if let Some(arr) = shell.arrays.get(name) {
         return arr.join(" ");
     }
+    if let Some(assoc) = shell.assoc_arrays.get(name) {
+        return assoc.values().cloned().collect::<Vec<_>>().join(" ");
+    }
     if let Some(v) = shell.vars.get(name) {
         return v.value.clone();
     }
@@ -194,36 +200,274 @@ pub fn var_get_if_exists(name: &str) -> Option<i64> {
     None
 }
 
-pub fn var_set(name: &str, value: &str, _export: bool) {
+pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
+    if shell
+        .vars
+        .get(name)
+        .map(|v| v.flags & crate::types::VAR_READONLY != 0)
+        .unwrap_or(false)
+    {
+        eprintln!("meowsh: {}: readonly variable", name);
+        return false;
+    }
     // Setting a scalar with the same name as an existing array clears the
     // array — they share a namespace.
     shell.arrays.remove(name);
+    shell.assoc_arrays.remove(name);
+    let mut flags = shell.vars.get(name).map(|v| v.flags).unwrap_or(0);
+    if export {
+        flags |= VAR_EXPORT;
+    }
     shell.vars.insert(
         name.to_string(),
         Var {
             value: value.to_string(),
-            flags: 0,
+            flags,
         },
     );
     env::set_var(name, value);
+
+    if let Some(array_name) = scalar_to_tied_array(name) {
+        let items = split_colon_list(value);
+        shell.arrays.insert(array_name.to_string(), items);
+    }
+    true
 }
 
 pub fn array_set(name: &str, items: Vec<String>) {
     let mut shell = SHELL.shell.lock().unwrap();
+    if shell.assoc_arrays.contains_key(name) {
+        let assoc = assoc_from_items(items);
+        shell.vars.remove(name);
+        shell.assoc_arrays.insert(name.to_string(), assoc);
+        return;
+    }
+    let items = maybe_unique_items(&shell, name, items);
     shell.vars.remove(name);
-    let joined = items.join(" ");
-    env::set_var(name, &joined);
+    sync_tied_scalar(&mut shell, name, &items);
+    if !is_tied_array(name) {
+        let joined = items.join(" ");
+        env::set_var(name, &joined);
+    }
     shell.arrays.insert(name.to_string(), items);
 }
 
 pub fn array_append(name: &str, items: Vec<String>) {
     let mut shell = SHELL.shell.lock().unwrap();
-    let existing = shell.arrays.entry(name.to_string()).or_default();
-    existing.extend(items);
-    let joined = existing.join(" ");
+    if let Some(existing) = shell.assoc_arrays.get(name).cloned() {
+        let mut assoc = existing;
+        assoc.extend(assoc_from_items(items));
+        shell.vars.remove(name);
+        shell.assoc_arrays.insert(name.to_string(), assoc);
+        return;
+    }
+    let mut combined = shell.arrays.get(name).cloned().unwrap_or_default();
+    combined.extend(items);
+    let combined = maybe_unique_items(&shell, name, combined);
     shell.vars.remove(name);
-    env::set_var(name, &joined);
+    sync_tied_scalar(&mut shell, name, &combined);
+    if !is_tied_array(name) {
+        let joined = combined.join(" ");
+        env::set_var(name, &joined);
+    }
+    shell.arrays.insert(name.to_string(), combined);
+}
+
+pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: bool) {
+    let mut shell = SHELL.shell.lock().unwrap();
+    if let Some(assoc) = shell.assoc_arrays.get_mut(name) {
+        let new_value = if append {
+            let mut current = assoc.get(subscript).cloned().unwrap_or_default();
+            current.push_str(&value);
+            current
+        } else {
+            value
+        };
+        assoc.insert(subscript.to_string(), new_value);
+        return;
+    }
+
+    let Ok(index) = subscript.parse::<isize>() else {
+        return;
+    };
+    if index == 0 {
+        return;
+    }
+    let mut items = shell.arrays.get(name).cloned().unwrap_or_default();
+    let idx = if index > 0 {
+        (index - 1) as usize
+    } else {
+        let len = items.len() as isize;
+        let resolved = len + index;
+        if resolved < 0 {
+            return;
+        }
+        resolved as usize
+    };
+    if items.len() <= idx {
+        items.resize(idx + 1, String::new());
+    }
+    if append {
+        items[idx].push_str(&value);
+    } else {
+        items[idx] = value;
+    }
+    let items = maybe_unique_items(&shell, name, items);
+    sync_tied_scalar(&mut shell, name, &items);
+    if !is_tied_array(name) {
+        env::set_var(name, items.join(" "));
+    }
+    shell.arrays.insert(name.to_string(), items);
+}
+
+pub fn array_make_unique(name: &str) {
+    let mut shell = SHELL.shell.lock().unwrap();
+    shell.unique_arrays.insert(name.to_string());
+    if let Some(items) = shell.arrays.get(name).cloned() {
+        let items = unique_items(items);
+        sync_tied_scalar(&mut shell, name, &items);
+        if !is_tied_array(name) {
+            env::set_var(name, items.join(" "));
+        }
+        shell.arrays.insert(name.to_string(), items);
+    }
+}
+
+pub fn array_declare(name: &str) {
+    let mut shell = SHELL.shell.lock().unwrap();
+    shell.vars.remove(name);
+    shell.assoc_arrays.remove(name);
+    shell.arrays.entry(name.to_string()).or_default();
+    let items = shell.arrays.get(name).cloned().unwrap_or_default();
+    sync_tied_scalar(&mut shell, name, &items);
+}
+
+pub fn assoc_declare(name: &str) {
+    let mut shell = SHELL.shell.lock().unwrap();
+    shell.vars.remove(name);
+    shell.arrays.remove(name);
+    shell
+        .assoc_arrays
+        .entry(name.to_string())
+        .or_insert_with(BTreeMap::new);
+}
+
+pub fn assoc_get(name: &str, key: &str) -> Option<String> {
+    SHELL
+        .shell
+        .lock()
+        .unwrap()
+        .assoc_arrays
+        .get(name)
+        .and_then(|assoc| assoc.get(key).cloned())
+}
+
+pub fn assoc_values(name: &str) -> Option<Vec<String>> {
+    SHELL
+        .shell
+        .lock()
+        .unwrap()
+        .assoc_arrays
+        .get(name)
+        .map(|assoc| assoc.values().cloned().collect())
+}
+
+pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
+    SHELL
+        .shell
+        .lock()
+        .unwrap()
+        .assoc_arrays
+        .get(name)
+        .map(|assoc| assoc.keys().cloned().collect())
+}
+
+fn seed_tied_array(shell: &mut Shell, array_name: &str, scalar_name: &str) {
+    if shell.arrays.contains_key(array_name) {
+        return;
+    }
+    if let Some(var) = shell.vars.get(scalar_name) {
+        shell
+            .arrays
+            .insert(array_name.to_string(), split_colon_list(&var.value));
+    }
+}
+
+fn scalar_to_tied_array(name: &str) -> Option<&'static str> {
+    match name {
+        "PATH" => Some("path"),
+        "FPATH" => Some("fpath"),
+        _ => None,
+    }
+}
+
+fn tied_array_to_scalar(name: &str) -> Option<&'static str> {
+    match name {
+        "path" => Some("PATH"),
+        "fpath" => Some("FPATH"),
+        _ => None,
+    }
+}
+
+fn is_tied_array(name: &str) -> bool {
+    tied_array_to_scalar(name).is_some()
+}
+
+fn split_colon_list(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split(':').map(|s| s.to_string()).collect()
+    }
+}
+
+fn sync_tied_scalar(shell: &mut Shell, name: &str, items: &[String]) {
+    if let Some(scalar_name) = tied_array_to_scalar(name) {
+        let value = items.join(":");
+        let flags = shell
+            .vars
+            .get(scalar_name)
+            .map(|v| v.flags)
+            .unwrap_or(VAR_EXPORT);
+        shell.vars.insert(
+            scalar_name.to_string(),
+            Var {
+                value: value.clone(),
+                flags,
+            },
+        );
+        env::set_var(scalar_name, value);
+    }
+}
+
+fn maybe_unique_items(shell: &Shell, name: &str, items: Vec<String>) -> Vec<String> {
+    if shell.unique_arrays.contains(name) {
+        unique_items(items)
+    } else {
+        items
+    }
+}
+
+fn unique_items(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn assoc_from_items(items: Vec<String>) -> BTreeMap<String, String> {
+    let mut assoc = BTreeMap::new();
+    let mut iter = items.into_iter();
+    while let Some(key) = iter.next() {
+        let value = iter.next().unwrap_or_default();
+        assoc.insert(key, value);
+    }
+    assoc
 }
 
 pub fn array_get(name: &str) -> Option<Vec<String>> {
@@ -231,7 +475,8 @@ pub fn array_get(name: &str) -> Option<Vec<String>> {
 }
 
 pub fn is_array(name: &str) -> bool {
-    SHELL.shell.lock().unwrap().arrays.contains_key(name)
+    let shell = SHELL.shell.lock().unwrap();
+    shell.arrays.contains_key(name) || shell.assoc_arrays.contains_key(name)
 }
 
 pub fn push_scope() {
@@ -338,10 +583,7 @@ pub fn expand_prompt(s: &str) -> String {
             Some('w') => out.push_str(&time_fmt("%a %d")),
             Some('W') => out.push_str(&time_fmt("%m/%d/%y")),
             Some('!') | Some('h') => out.push_str(&history_count()),
-            Some('?') => out.push_str(&format!(
-                "{}",
-                SHELL.shell.lock().unwrap().last_status
-            )),
+            Some('?') => out.push_str(&format!("{}", SHELL.shell.lock().unwrap().last_status)),
             Some('j') => out.push_str(&jobs_count()),
             Some('B') => out.push_str("\x1b[1m"),
             Some('b') => out.push_str("\x1b[22m"),
@@ -551,11 +793,52 @@ pub fn command_exists(name: &str) -> bool {
     }
 
     let builtins = [
-        "exit", "cd", "source", ".", "pwd", "echo", "true", "false", "test", "[", "jobs", "fg",
-        "bg", "export", "set", "setopt", "unsetopt", "unset", "alias", "unalias", "read", "shift",
-        "local", "type", "kill", "wait", "umask", "return", "eval", "trap", "ulimit", "readonly",
-        "history", "zstyle", "add-zsh-hook", "autoload", "compinit", "compdef", "compaudit",
-        "bindkey", "zmodload",
+        ":",
+        "exit",
+        "cd",
+        "source",
+        ".",
+        "pwd",
+        "echo",
+        "true",
+        "false",
+        "test",
+        "[",
+        "jobs",
+        "fg",
+        "bg",
+        "export",
+        "set",
+        "setopt",
+        "unsetopt",
+        "unset",
+        "alias",
+        "unalias",
+        "read",
+        "shift",
+        "local",
+        "typeset",
+        "declare",
+        "type",
+        "kill",
+        "wait",
+        "break",
+        "continue",
+        "umask",
+        "return",
+        "eval",
+        "trap",
+        "ulimit",
+        "readonly",
+        "history",
+        "zstyle",
+        "add-zsh-hook",
+        "autoload",
+        "compinit",
+        "compdef",
+        "compaudit",
+        "bindkey",
+        "zmodload",
     ];
     if builtins.contains(&name) {
         return true;
@@ -583,7 +866,11 @@ mod tests {
         let s = expand_prompt("%F{red}x%f");
         assert!(s.contains("\x1b[31m"), "missing red SGR in {:?}", s);
         assert!(s.contains('x'));
-        assert!(s.contains("\x1b[39m"), "missing default fg reset in {:?}", s);
+        assert!(
+            s.contains("\x1b[39m"),
+            "missing default fg reset in {:?}",
+            s
+        );
     }
 
     #[test]
@@ -654,7 +941,7 @@ mod tests {
         shell_init();
         let path = var_get("PATH");
         println!("PATH in meowsh: {}", path);
-        
+
         let ls_exists = command_exists("ls");
         println!("ls exists: {}", ls_exists);
         assert!(ls_exists, "ls should exist in PATH");
@@ -664,7 +951,10 @@ mod tests {
             if cargo_path.status.success() {
                 let cargo_exists = command_exists("cargo");
                 println!("cargo exists: {}", cargo_exists);
-                assert!(cargo_exists, "cargo should exist in PATH if it exists in environment");
+                assert!(
+                    cargo_exists,
+                    "cargo should exist in PATH if it exists in environment"
+                );
             }
         }
     }
