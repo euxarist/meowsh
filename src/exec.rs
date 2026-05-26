@@ -1026,10 +1026,14 @@ fn builtin_cd(args: &[String]) -> i32 {
 }
 
 fn builtin_pushd(args: &[String]) -> i32 {
+    let mut popped = None;
     let target = if args.is_empty() {
         let prev = SHELL.shell.lock().unwrap().dir_stack.pop();
         match prev {
-            Some(dir) => dir,
+            Some(dir) => {
+                popped = Some(dir.clone());
+                dir
+            }
             None => {
                 eprintln!("meowsh: pushd: directory stack empty");
                 return 1;
@@ -1046,6 +1050,8 @@ fn builtin_pushd(args: &[String]) -> i32 {
     if status == 0 {
         SHELL.shell.lock().unwrap().dir_stack.push(old_pwd);
         print_dirs();
+    } else if let Some(dir) = popped {
+        SHELL.shell.lock().unwrap().dir_stack.push(dir);
     }
     status
 }
@@ -1059,9 +1065,11 @@ fn builtin_popd(_args: &[String]) -> i32 {
         eprintln!("meowsh: popd: directory stack empty");
         return 1;
     };
-    let status = builtin_cd(&[target]);
+    let status = builtin_cd(std::slice::from_ref(&target));
     if status == 0 {
         print_dirs();
+    } else {
+        SHELL.shell.lock().unwrap().dir_stack.push(target);
     }
     status
 }

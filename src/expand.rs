@@ -392,9 +392,11 @@ pub fn expand_var_expr(expr: &str) -> String {
     }
     if let Some(name) = expr.strip_prefix('!') {
         let target = var_get(name);
-        if !target.is_empty() {
-            return var_get(&target);
-        }
+        return if !target.is_empty() {
+            var_get(&target)
+        } else {
+            String::new()
+        };
     }
 
     if let Some(rest) = expr.strip_prefix("(k)") {

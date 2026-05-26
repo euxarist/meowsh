@@ -192,6 +192,14 @@ pub fn var_get(name: &str) -> String {
 
 pub fn var_exists(name: &str) -> bool {
     let shell = SHELL.shell.lock().unwrap();
+    if matches!(name, "?" | "$" | "!" | "0" | "#" | "@" | "*" | "-") {
+        return true;
+    }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(idx) = name.parse::<usize>() {
+            return idx == 0 || idx <= shell.pos_params.len();
+        }
+    }
     shell.vars.contains_key(name)
         || shell.arrays.contains_key(name)
         || shell.assoc_arrays.contains_key(name)
