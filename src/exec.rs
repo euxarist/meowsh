@@ -131,14 +131,20 @@ fn exec_simple(node: &ASTNode) -> i32 {
     }
     for (name, items) in &node.array_assigns {
         let expanded = expand_array_items(items);
-        crate::shell::array_set(name, expanded);
+        if !crate::shell::array_set(name, expanded) {
+            return 1;
+        }
     }
     for (name, items) in &node.array_appends {
         let expanded = expand_array_items(items);
-        crate::shell::array_append(name, expanded);
+        if !crate::shell::array_append(name, expanded) {
+            return 1;
+        }
     }
     for (name, subscript, value, is_append) in &node.subscript_assigns {
-        array_set_subscript(name, &expand_all(subscript), expand_all(value), *is_append);
+        if !array_set_subscript(name, &expand_all(subscript), expand_all(value), *is_append) {
+            return 1;
+        }
     }
 
     let mut expanded_args: Vec<String> = node.args.iter().map(|arg| expand_all(arg)).collect();
@@ -184,7 +190,14 @@ fn exec_simple(node: &ASTNode) -> i32 {
         }
     }
 
-    let saved_fds = handle_redirections(&node.redirs);
+    let saved_fds = match handle_redirections(&node.redirs) {
+        Ok(saved) => saved,
+        Err(e) => {
+            eprintln!("meowsh: redirection: {}", e);
+            SHELL.shell.lock().unwrap().last_status = 1;
+            return 1;
+        }
+    };
 
     let foreground = node.conn != "&";
     let status = exec_command(&expanded_args, foreground);
@@ -196,49 +209,57 @@ fn exec_simple(node: &ASTNode) -> i32 {
 }
 
 #[allow(clippy::suspicious_open_options)]
-fn handle_redirections(redirs: &[Redir]) -> Option<SavedFds> {
+fn handle_redirections(redirs: &[Redir]) -> io::Result<Option<SavedFds>> {
     if redirs.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let mut saved = SavedFds { fds: Vec::new() };
+    let mut saved = Some(SavedFds { fds: Vec::new() });
 
     for redir in redirs {
         let target = expand_all(&redir.file);
-        saved.save(redir.fd);
+        saved.as_mut().unwrap().save(redir.fd);
 
         match redir.op.as_str() {
             ">" | ">|" => {
-                if let Ok(f) = fs::File::create(&target) {
-                    unsafe {
-                        libc::dup2(f.as_raw_fd(), redir.fd);
-                    }
+                let f = match fs::File::create(&target) {
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             ">>" => {
-                if let Ok(f) = OpenOptions::new().append(true).create(true).open(&target) {
-                    unsafe {
-                        libc::dup2(f.as_raw_fd(), redir.fd);
-                    }
+                let f = match OpenOptions::new().append(true).create(true).open(&target) {
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             "<" => {
-                if let Ok(f) = fs::File::open(&target) {
-                    unsafe {
-                        libc::dup2(f.as_raw_fd(), redir.fd);
-                    }
+                let f = match fs::File::open(&target) {
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             "<>" => {
-                if let Ok(f) = OpenOptions::new()
+                let f = match OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .open(&target)
                 {
-                    unsafe {
-                        libc::dup2(f.as_raw_fd(), redir.fd);
-                    }
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             "<&" | ">&" => {
@@ -247,47 +268,82 @@ fn handle_redirections(redirs: &[Redir]) -> Option<SavedFds> {
                         libc::close(redir.fd);
                     }
                 } else if let Ok(fd_num) = redir.file.parse::<i32>() {
-                    unsafe {
-                        libc::dup2(fd_num, redir.fd);
+                    if let Err(e) = dup2_checked(fd_num, redir.fd) {
+                        return Err(redirection_error(saved.take().unwrap(), e));
                     }
+                } else {
+                    let err = io::Error::new(io::ErrorKind::InvalidInput, "bad file descriptor");
+                    return Err(redirection_error(saved.take().unwrap(), err));
                 }
             }
             "<<" | "<<-" => {
                 let mut fd: [i32; 2] = [-1; 2];
                 unsafe {
-                    if libc::pipe(fd.as_mut_ptr()) == 0 {
-                        if !redir.heredoc_body.is_empty() {
-                            libc::write(
-                                fd[1],
-                                redir.heredoc_body.as_ptr() as *const libc::c_void,
-                                redir.heredoc_body.len(),
-                            );
-                        }
-                        libc::close(fd[1]);
-                        libc::dup2(fd[0], redir.fd);
-                        libc::close(fd[0]);
+                    if libc::pipe(fd.as_mut_ptr()) != 0 {
+                        return Err(redirection_error(
+                            saved.take().unwrap(),
+                            io::Error::last_os_error(),
+                        ));
                     }
+                    if !redir.heredoc_body.is_empty() {
+                        let written = libc::write(
+                            fd[1],
+                            redir.heredoc_body.as_ptr() as *const libc::c_void,
+                            redir.heredoc_body.len(),
+                        );
+                        if written < 0 {
+                            let err = io::Error::last_os_error();
+                            libc::close(fd[0]);
+                            libc::close(fd[1]);
+                            return Err(redirection_error(saved.take().unwrap(), err));
+                        }
+                    }
+                    libc::close(fd[1]);
+                    if libc::dup2(fd[0], redir.fd) < 0 {
+                        let err = io::Error::last_os_error();
+                        libc::close(fd[0]);
+                        return Err(redirection_error(saved.take().unwrap(), err));
+                    }
+                    libc::close(fd[0]);
                 }
             }
             _ => {}
         }
     }
 
-    Some(saved)
+    Ok(saved)
 }
 
 fn restore_fds(saved: Option<SavedFds>) {
     if let Some(fds) = saved {
         for (target, saved_fd) in fds.fds.into_iter().rev() {
-            unsafe {
-                libc::dup2(saved_fd.as_raw_fd(), target);
+            match saved_fd {
+                Some(saved_fd) => unsafe {
+                    libc::dup2(saved_fd.as_raw_fd(), target);
+                },
+                None => unsafe {
+                    libc::close(target);
+                },
             }
         }
     }
 }
 
+fn redirection_error(saved: SavedFds, err: io::Error) -> io::Error {
+    restore_fds(Some(saved));
+    err
+}
+
+fn dup2_checked(from: i32, to: i32) -> io::Result<()> {
+    if unsafe { libc::dup2(from, to) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 struct SavedFds {
-    fds: Vec<(i32, OwnedFd)>,
+    fds: Vec<(i32, Option<OwnedFd>)>,
 }
 
 impl SavedFds {
@@ -298,7 +354,9 @@ impl SavedFds {
         let dup_fd = unsafe { libc::dup(fd) };
         if dup_fd >= 0 {
             let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-            self.fds.push((fd, owned));
+            self.fds.push((fd, Some(owned)));
+        } else if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            self.fds.push((fd, None));
         }
     }
 }
@@ -1383,14 +1441,14 @@ fn builtin_typeset(args: &[String]) -> i32 {
             eprintln!("meowsh: typeset: `{}': not a valid identifier", spec);
             return 1;
         }
-        if array {
-            array_declare(name);
+        if array && !array_declare(name) {
+            return 1;
         }
-        if associative {
-            assoc_declare(name);
+        if associative && !assoc_declare(name) {
+            return 1;
         }
-        if unique {
-            array_make_unique(name);
+        if unique && !array_make_unique(name) {
+            return 1;
         }
         if let Some(value) = value {
             let expanded = expand_all(value);
@@ -1435,8 +1493,11 @@ fn builtin_zstyle(args: &[String]) -> i32 {
                 return 1;
             }
             if let Some(values) = zstyle_lookup(&args[1], &args[2]) {
-                crate::shell::array_set(&args[3], values);
-                0
+                if crate::shell::array_set(&args[3], values) {
+                    0
+                } else {
+                    1
+                }
             } else {
                 1
             }
@@ -1469,6 +1530,7 @@ fn builtin_zstyle(args: &[String]) -> i32 {
             }
             let entry = ZStyle {
                 pattern: args[0].clone(),
+                matcher: glob::Pattern::new(&args[0]).ok(),
                 style: args[1].clone(),
                 values: args[2..].to_vec(),
             };
@@ -1493,15 +1555,17 @@ fn zstyle_lookup(context: &str, style: &str) -> Option<Vec<String>> {
         .zstyles
         .iter()
         .rev()
-        .find(|entry| entry.style == style && zstyle_pattern_matches(&entry.pattern, context))
+        .find(|entry| entry.style == style && zstyle_pattern_matches(entry, context))
         .map(|entry| entry.values.clone())
 }
 
-fn zstyle_pattern_matches(pattern: &str, context: &str) -> bool {
-    if pattern == context {
+fn zstyle_pattern_matches(entry: &ZStyle, context: &str) -> bool {
+    if entry.pattern == context {
         return true;
     }
-    glob::Pattern::new(pattern)
+    entry
+        .matcher
+        .as_ref()
         .map(|p| p.matches(context))
         .unwrap_or(false)
 }

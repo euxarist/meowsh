@@ -40,6 +40,7 @@ pub struct Var {
 #[derive(Clone)]
 pub struct ZStyle {
     pub pattern: String,
+    pub matcher: Option<glob::Pattern>,
     pub style: String,
     pub values: Vec<String>,
 }

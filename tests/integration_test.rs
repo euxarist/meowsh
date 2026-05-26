@@ -172,6 +172,31 @@ fn test_fd_duplication_redirection() {
 }
 
 #[test]
+fn test_redirection_failure_aborts_command() {
+    let (status, stdout, stderr) =
+        run_script(r#"echo should_not_run > /definitely/missing/meowsh/out; echo "status=$?""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1");
+    assert!(stderr.contains("redirection"));
+    assert!(!stdout.contains("should_not_run"));
+}
+
+#[test]
+fn test_redirection_restores_originally_closed_fd() {
+    let temp_dir = TempDir::new().unwrap();
+    let out_path = temp_dir.path().join("out.txt");
+    let script = format!(
+        r#": 99> "{}"; echo leak >&99; echo "status=$?""#,
+        out_path.display()
+    );
+    let (status, stdout, stderr) = run_script(&script);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1");
+    assert!(stderr.contains("Bad file descriptor"));
+    assert_eq!(fs::read_to_string(out_path).unwrap(), "");
+}
+
+#[test]
 fn test_parameter_expansion_remove_suffix() {
     let script = r#"
         set -f
@@ -774,6 +799,24 @@ fn test_posix_readonly_rejects_reassignment() {
 fn test_posix_readonly_rejects_second_readonly_assignment() {
     let (status, stdout, stderr) =
         run_script(r#"readonly answer=42; readonly answer=99; echo "status=$? answer=$answer""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1 answer=42");
+    assert!(stderr.contains("readonly variable"));
+}
+
+#[test]
+fn test_readonly_rejects_array_assignment() {
+    let (status, stdout, stderr) =
+        run_script(r#"readonly answer=42; answer=(99); echo "status=$? answer=$answer""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "status=1 answer=42");
+    assert!(stderr.contains("readonly variable"));
+}
+
+#[test]
+fn test_readonly_rejects_subscript_assignment() {
+    let (status, stdout, stderr) =
+        run_script(r#"readonly answer=42; answer[1]=99; echo "status=$? answer=$answer""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1 answer=42");
     assert!(stderr.contains("readonly variable"));

@@ -235,47 +235,54 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     true
 }
 
-pub fn array_set(name: &str, items: Vec<String>) {
+pub fn array_set(name: &str, items: Vec<String>) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
+    if !prepare_array_mutation(&mut shell, name) {
+        return false;
+    }
     if shell.assoc_arrays.contains_key(name) {
         let assoc = assoc_from_items(items);
-        shell.vars.remove(name);
         shell.assoc_arrays.insert(name.to_string(), assoc);
-        return;
+        return true;
     }
     let items = maybe_unique_items(&shell, name, items);
-    shell.vars.remove(name);
     sync_tied_scalar(&mut shell, name, &items);
     if !is_tied_array(name) {
         let joined = items.join(" ");
         env::set_var(name, &joined);
     }
     shell.arrays.insert(name.to_string(), items);
+    true
 }
 
-pub fn array_append(name: &str, items: Vec<String>) {
+pub fn array_append(name: &str, items: Vec<String>) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
+    if !prepare_array_mutation(&mut shell, name) {
+        return false;
+    }
     if let Some(existing) = shell.assoc_arrays.get(name).cloned() {
         let mut assoc = existing;
         assoc.extend(assoc_from_items(items));
-        shell.vars.remove(name);
         shell.assoc_arrays.insert(name.to_string(), assoc);
-        return;
+        return true;
     }
     let mut combined = shell.arrays.get(name).cloned().unwrap_or_default();
     combined.extend(items);
     let combined = maybe_unique_items(&shell, name, combined);
-    shell.vars.remove(name);
     sync_tied_scalar(&mut shell, name, &combined);
     if !is_tied_array(name) {
         let joined = combined.join(" ");
         env::set_var(name, &joined);
     }
     shell.arrays.insert(name.to_string(), combined);
+    true
 }
 
-pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: bool) {
+pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: bool) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
+    if !prepare_array_mutation(&mut shell, name) {
+        return false;
+    }
     if let Some(assoc) = shell.assoc_arrays.get_mut(name) {
         let new_value = if append {
             let mut current = assoc.get(subscript).cloned().unwrap_or_default();
@@ -285,14 +292,14 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
             value
         };
         assoc.insert(subscript.to_string(), new_value);
-        return;
+        return true;
     }
 
     let Ok(index) = subscript.parse::<isize>() else {
-        return;
+        return false;
     };
     if index == 0 {
-        return;
+        return false;
     }
     let mut items = shell.arrays.get(name).cloned().unwrap_or_default();
     let idx = if index > 0 {
@@ -301,7 +308,7 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
         let len = items.len() as isize;
         let resolved = len + index;
         if resolved < 0 {
-            return;
+            return false;
         }
         resolved as usize
     };
@@ -319,10 +326,14 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
         env::set_var(name, items.join(" "));
     }
     shell.arrays.insert(name.to_string(), items);
+    true
 }
 
-pub fn array_make_unique(name: &str) {
+pub fn array_make_unique(name: &str) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
+    if !prepare_array_mutation(&mut shell, name) {
+        return false;
+    }
     shell.unique_arrays.insert(name.to_string());
     if let Some(items) = shell.arrays.get(name).cloned() {
         let items = unique_items(items);
@@ -332,25 +343,32 @@ pub fn array_make_unique(name: &str) {
         }
         shell.arrays.insert(name.to_string(), items);
     }
+    true
 }
 
-pub fn array_declare(name: &str) {
+pub fn array_declare(name: &str) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
-    shell.vars.remove(name);
+    if !prepare_array_mutation(&mut shell, name) {
+        return false;
+    }
     shell.assoc_arrays.remove(name);
     shell.arrays.entry(name.to_string()).or_default();
     let items = shell.arrays.get(name).cloned().unwrap_or_default();
     sync_tied_scalar(&mut shell, name, &items);
+    true
 }
 
-pub fn assoc_declare(name: &str) {
+pub fn assoc_declare(name: &str) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
-    shell.vars.remove(name);
+    if !prepare_array_mutation(&mut shell, name) {
+        return false;
+    }
     shell.arrays.remove(name);
     shell
         .assoc_arrays
         .entry(name.to_string())
         .or_insert_with(BTreeMap::new);
+    true
 }
 
 pub fn assoc_get(name: &str, key: &str) -> Option<String> {
@@ -381,6 +399,17 @@ pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
         .assoc_arrays
         .get(name)
         .map(|assoc| assoc.keys().cloned().collect())
+}
+
+fn prepare_array_mutation(shell: &mut Shell, name: &str) -> bool {
+    if let Some(var) = shell.vars.get_mut(name) {
+        if var.flags & crate::types::VAR_READONLY != 0 {
+            eprintln!("meowsh: {}: readonly variable", name);
+            return false;
+        }
+        var.value.clear();
+    }
+    true
 }
 
 fn seed_tied_array(shell: &mut Shell, array_name: &str, scalar_name: &str) {

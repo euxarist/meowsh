@@ -330,9 +330,9 @@ pub fn expand_variable(s: &str) -> String {
                                 break;
                             }
                         }
-                    } else if ch.is_alphabetic() || ch == '_' {
+                    } else if ch.is_ascii_alphabetic() || ch == '_' {
                         while let Some(&name_ch) = chars.peek() {
-                            if name_ch.is_alphanumeric() || name_ch == '_' {
+                            if name_ch.is_ascii_alphanumeric() || name_ch == '_' {
                                 name.push(chars.next().unwrap());
                             } else {
                                 break;
