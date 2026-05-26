@@ -1,4 +1,6 @@
-use crate::shell::{array_get, var_get, var_get_if_exists, var_set, SHELL};
+use crate::shell::{
+    array_get, assoc_get, assoc_keys, assoc_values, var_get, var_get_if_exists, var_set, SHELL,
+};
 use std::process::Command;
 
 pub fn expand_all(s: &str) -> String {
@@ -63,7 +65,14 @@ pub fn expand_braces(s: &str) -> String {
                                 // If it's just {a}, we should NOT expand it, but we MUST
                                 // check if there are OTHER braces in the suffix.
                                 // We can just reconstruct and continue searching after this brace.
-                                let reconstructed = format!("{}{}{}{}{}", prefix, '{', inner, '}', expand_braces(suffix));
+                                let reconstructed = format!(
+                                    "{}{}{}{}{}",
+                                    prefix,
+                                    '{',
+                                    inner,
+                                    '}',
+                                    expand_braces(suffix)
+                                );
                                 return reconstructed;
                             }
                         }
@@ -310,19 +319,25 @@ pub fn expand_variable(s: &str) -> String {
                 continue;
             } else {
                 let mut name = String::new();
-                while let Some(&ch) = chars.peek() {
-                    if ch.is_alphanumeric()
-                        || ch == '_'
-                        || ch == '?'
-                        || ch == '$'
-                        || ch == '!'
-                        || ch == '#'
-                        || ch == '@'
-                        || ch == '*'
-                    {
+                if let Some(&ch) = chars.peek() {
+                    if matches!(ch, '?' | '$' | '!' | '#' | '@' | '*' | '-') {
                         name.push(chars.next().unwrap());
-                    } else {
-                        break;
+                    } else if ch.is_ascii_digit() {
+                        while let Some(&digit) = chars.peek() {
+                            if digit.is_ascii_digit() {
+                                name.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                    } else if ch.is_ascii_alphabetic() || ch == '_' {
+                        while let Some(&name_ch) = chars.peek() {
+                            if name_ch.is_ascii_alphanumeric() || name_ch == '_' {
+                                name.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
                     }
                 }
                 if !name.is_empty() {
@@ -330,7 +345,15 @@ pub fn expand_variable(s: &str) -> String {
                     if val.is_empty() {
                         let is_unset = {
                             let shell = SHELL.shell.lock().unwrap();
-                            if name == "$" || name == "?" || name == "!" || name == "0" || name == "#" || name == "@" || name == "*" || name == "-" {
+                            if name == "$"
+                                || name == "?"
+                                || name == "!"
+                                || name == "0"
+                                || name == "#"
+                                || name == "@"
+                                || name == "*"
+                                || name == "-"
+                            {
                                 false
                             } else {
                                 !shell.vars.contains_key(&name)
@@ -363,10 +386,36 @@ pub fn expand_variable(s: &str) -> String {
 }
 
 pub fn expand_var_expr(expr: &str) -> String {
+    if let Some(rest) = expr.strip_prefix("(k)") {
+        if let Some(keys) = assoc_keys(rest) {
+            return keys.join(" ");
+        }
+    }
+    if let Some(rest) = expr.strip_prefix("(@k)") {
+        if let Some(keys) = assoc_keys(rest) {
+            return keys.join(" ");
+        }
+    }
+    if let Some(rest) = expr.strip_prefix("(v)") {
+        if let Some(values) = assoc_values(rest) {
+            return values.join(" ");
+        }
+    }
+    if let Some(rest) = expr.strip_prefix("(@v)") {
+        if let Some(values) = assoc_values(rest) {
+            return values.join(" ");
+        }
+    }
+
     if expr.starts_with('#') && expr.len() > 1 {
         let inner = &expr[1..];
         // ${#arr[@]} or ${#arr[*]} — element count.
         if let Some((name, sub)) = split_subscript(inner) {
+            if matches!(sub, "@" | "*") {
+                if let Some(values) = assoc_values(name) {
+                    return values.len().to_string();
+                }
+            }
             if matches!(sub, "@" | "*") {
                 if let Some(arr) = array_get(name) {
                     return arr.len().to_string();
@@ -395,9 +444,13 @@ pub fn expand_var_expr(expr: &str) -> String {
 
     fn expand_pattern(word: &str) -> String {
         let old_opts = { SHELL.shell.lock().unwrap().opts };
-        { SHELL.shell.lock().unwrap().opts |= crate::types::OPT_NOGLOB; }
+        {
+            SHELL.shell.lock().unwrap().opts |= crate::types::OPT_NOGLOB;
+        }
         let res = expand_variable(word);
-        { SHELL.shell.lock().unwrap().opts = old_opts; }
+        {
+            SHELL.shell.lock().unwrap().opts = old_opts;
+        }
         res
     }
 
@@ -484,6 +537,13 @@ fn split_subscript(expr: &str) -> Option<(&str, &str)> {
 }
 
 fn read_subscript(name: &str, sub: &str) -> String {
+    if let Some(values) = assoc_values(name) {
+        if matches!(sub, "@" | "*") {
+            return values.join(" ");
+        }
+        return assoc_get(name, sub).unwrap_or_default();
+    }
+
     let arr = match array_get(name) {
         Some(a) => a,
         None => {
@@ -607,7 +667,11 @@ fn substitute(
     let matches_at = |s: &str| -> Option<usize> {
         if !has_meta {
             // Literal substring match — much faster than per-substring glob.
-            return if s.starts_with(pat) { Some(pat.len()) } else { None };
+            return if s.starts_with(pat) {
+                Some(pat.len())
+            } else {
+                None
+            };
         }
         // Glob path: try increasing lengths starting from `s`.
         let glob_pat = glob_pat.as_ref()?;
@@ -827,4 +891,3 @@ fn strip_prefix(val: &str, pattern: &str, longest: bool) -> String {
     }
     val.to_string()
 }
-

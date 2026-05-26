@@ -3,13 +3,14 @@ use crate::jobs::{builtin_bg, builtin_fg, builtin_jobs, job_wait_foreground};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::shell::{
-    declare_local, find_command, in_function_scope, pop_scope, push_scope, var_get, var_set, SHELL,
+    array_declare, array_make_unique, array_set_subscript, assoc_declare, declare_local,
+    find_command, in_function_scope, pop_scope, push_scope, var_get, var_set, SHELL,
 };
-use crate::types::{ASTNode, Job, JobState, ProcState, Redir};
+use crate::types::{ASTNode, Job, JobState, ProcState, Redir, ZStyle};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -38,7 +39,7 @@ pub fn execute_line(line: &str) {
     while let Some(node) = parser.parse() {
         let status = exec_node(&node);
         SHELL.shell.lock().unwrap().last_status = status;
-        
+
         if status != 0 {
             let opts = SHELL.shell.lock().unwrap().opts;
             if opts & crate::types::OPT_ERREXIT != 0 {
@@ -76,6 +77,7 @@ pub fn exec_node(node: &ASTNode) -> i32 {
         && node.scalar_appends.is_empty()
         && node.array_assigns.is_empty()
         && node.array_appends.is_empty()
+        && node.subscript_assigns.is_empty()
         && node.pipes.is_empty()
         && node.loop_var.is_empty()
     {
@@ -110,25 +112,39 @@ fn exec_simple(node: &ASTNode) -> i32 {
         && node.scalar_appends.is_empty()
         && node.array_assigns.is_empty()
         && node.array_appends.is_empty()
+        && node.subscript_assigns.is_empty()
     {
         return 0;
     }
 
     for (name, value) in &node.assigns {
-        var_set(name, &expand_all(value), false);
+        if !var_set(name, &expand_all(value), false) {
+            return 1;
+        }
     }
     for (name, value) in &node.scalar_appends {
         let prev = var_get(name);
         let appended = format!("{}{}", prev, expand_all(value));
-        var_set(name, &appended, false);
+        if !var_set(name, &appended, false) {
+            return 1;
+        }
     }
     for (name, items) in &node.array_assigns {
-        let expanded: Vec<String> = items.iter().map(|s| expand_all(s)).collect();
-        crate::shell::array_set(name, expanded);
+        let expanded = expand_array_items(items);
+        if !crate::shell::array_set(name, expanded) {
+            return 1;
+        }
     }
     for (name, items) in &node.array_appends {
-        let expanded: Vec<String> = items.iter().map(|s| expand_all(s)).collect();
-        crate::shell::array_append(name, expanded);
+        let expanded = expand_array_items(items);
+        if !crate::shell::array_append(name, expanded) {
+            return 1;
+        }
+    }
+    for (name, subscript, value, is_append) in &node.subscript_assigns {
+        if !array_set_subscript(name, &expand_all(subscript), expand_all(value), *is_append) {
+            return 1;
+        }
     }
 
     let mut expanded_args: Vec<String> = node.args.iter().map(|arg| expand_all(arg)).collect();
@@ -174,7 +190,14 @@ fn exec_simple(node: &ASTNode) -> i32 {
         }
     }
 
-    let saved_fds = handle_redirections(&node.redirs);
+    let saved_fds = match handle_redirections(&node.redirs) {
+        Ok(saved) => saved,
+        Err(e) => {
+            eprintln!("meowsh: redirection: {}", e);
+            SHELL.shell.lock().unwrap().last_status = 1;
+            return 1;
+        }
+    };
 
     let foreground = node.conn != "&";
     let status = exec_command(&expanded_args, foreground);
@@ -186,125 +209,156 @@ fn exec_simple(node: &ASTNode) -> i32 {
 }
 
 #[allow(clippy::suspicious_open_options)]
-fn handle_redirections(redirs: &[Redir]) -> Option<SavedFds> {
+fn handle_redirections(redirs: &[Redir]) -> io::Result<Option<SavedFds>> {
     if redirs.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let stdin_fd = dup_fd(0)?;
-    let stdout_fd = dup_fd(1)?;
-    let stderr_fd = dup_fd(2)?;
+    let mut saved = Some(SavedFds { fds: Vec::new() });
 
     for redir in redirs {
         let target = expand_all(&redir.file);
+        saved.as_mut().unwrap().save(redir.fd);
 
         match redir.op.as_str() {
             ">" | ">|" => {
-                if let Ok(f) = fs::File::create(&target) {
-                    let fd = f.into_raw_fd();
-                    unsafe {
-                        libc::dup2(fd, 1);
-                    }
+                let f = match fs::File::create(&target) {
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             ">>" => {
-                if let Ok(f) = OpenOptions::new().append(true).create(true).open(&target) {
-                    let fd = f.into_raw_fd();
-                    unsafe {
-                        libc::dup2(fd, 1);
-                    }
+                let f = match OpenOptions::new().append(true).create(true).open(&target) {
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             "<" => {
-                if let Ok(f) = fs::File::open(&target) {
-                    let fd = f.into_raw_fd();
-                    unsafe {
-                        libc::dup2(fd, 0);
-                    }
+                let f = match fs::File::open(&target) {
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             "<>" => {
-                if let Ok(f) = OpenOptions::new()
+                let f = match OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .open(&target)
                 {
-                    let fd = f.into_raw_fd();
-                    unsafe {
-                        libc::dup2(fd, 0);
-                        libc::dup2(fd, 1);
-                    }
+                    Ok(f) => f,
+                    Err(e) => return Err(redirection_error(saved.take().unwrap(), e)),
+                };
+                if let Err(e) = dup2_checked(f.as_raw_fd(), redir.fd) {
+                    return Err(redirection_error(saved.take().unwrap(), e));
                 }
             }
             "<&" | ">&" => {
-                if let Ok(fd_num) = redir.file.parse::<i32>() {
+                if redir.file == "-" {
                     unsafe {
-                        if redir.op == "<&" {
-                            libc::dup2(fd_num, 0);
-                        } else {
-                            libc::dup2(fd_num, 1);
-                        }
+                        libc::close(redir.fd);
                     }
+                } else if let Ok(fd_num) = redir.file.parse::<i32>() {
+                    if let Err(e) = dup2_checked(fd_num, redir.fd) {
+                        return Err(redirection_error(saved.take().unwrap(), e));
+                    }
+                } else {
+                    let err = io::Error::new(io::ErrorKind::InvalidInput, "bad file descriptor");
+                    return Err(redirection_error(saved.take().unwrap(), err));
                 }
             }
             "<<" | "<<-" => {
-                if !redir.heredoc_body.is_empty() {
-                    let mut fd: [i32; 2] = [-1; 2];
-                    unsafe {
-                        if libc::pipe(fd.as_mut_ptr()) == 0 {
-                            libc::write(
-                                fd[1],
-                                redir.heredoc_body.as_ptr() as *const libc::c_void,
-                                redir.heredoc_body.len(),
-                            );
-                            libc::close(fd[1]);
-                            libc::dup2(fd[0], 0);
+                let mut fd: [i32; 2] = [-1; 2];
+                unsafe {
+                    if libc::pipe(fd.as_mut_ptr()) != 0 {
+                        return Err(redirection_error(
+                            saved.take().unwrap(),
+                            io::Error::last_os_error(),
+                        ));
+                    }
+                    if !redir.heredoc_body.is_empty() {
+                        let written = libc::write(
+                            fd[1],
+                            redir.heredoc_body.as_ptr() as *const libc::c_void,
+                            redir.heredoc_body.len(),
+                        );
+                        if written < 0 {
+                            let err = io::Error::last_os_error();
                             libc::close(fd[0]);
+                            libc::close(fd[1]);
+                            return Err(redirection_error(saved.take().unwrap(), err));
                         }
                     }
+                    libc::close(fd[1]);
+                    if libc::dup2(fd[0], redir.fd) < 0 {
+                        let err = io::Error::last_os_error();
+                        libc::close(fd[0]);
+                        return Err(redirection_error(saved.take().unwrap(), err));
+                    }
+                    libc::close(fd[0]);
                 }
             }
             _ => {}
         }
     }
 
-    Some(SavedFds {
-        stdin: stdin_fd,
-        stdout: stdout_fd,
-        stderr: stderr_fd,
-    })
+    Ok(saved)
 }
 
 fn restore_fds(saved: Option<SavedFds>) {
     if let Some(fds) = saved {
-        unsafe {
-            let stdin = fds.stdin.into_raw_fd();
-            let stdout = fds.stdout.into_raw_fd();
-            let stderr = fds.stderr.into_raw_fd();
-            libc::dup2(stdin, 0);
-            libc::dup2(stdout, 1);
-            libc::dup2(stderr, 2);
-            libc::close(stdin);
-            libc::close(stdout);
-            libc::close(stderr);
+        for (target, saved_fd) in fds.fds.into_iter().rev() {
+            match saved_fd {
+                Some(saved_fd) => unsafe {
+                    libc::dup2(saved_fd.as_raw_fd(), target);
+                },
+                None => unsafe {
+                    libc::close(target);
+                },
+            }
         }
     }
 }
 
-fn dup_fd(fd: i32) -> Option<OwnedFd> {
-    let duped = unsafe { libc::dup(fd) };
-    if duped < 0 {
-        None
+fn redirection_error(saved: SavedFds, err: io::Error) -> io::Error {
+    restore_fds(Some(saved));
+    err
+}
+
+fn dup2_checked(from: i32, to: i32) -> io::Result<()> {
+    if unsafe { libc::dup2(from, to) } < 0 {
+        Err(io::Error::last_os_error())
     } else {
-        Some(unsafe { OwnedFd::from_raw_fd(duped) })
+        Ok(())
     }
 }
 
 struct SavedFds {
-    stdin: OwnedFd,
-    stdout: OwnedFd,
-    stderr: OwnedFd,
+    fds: Vec<(i32, Option<OwnedFd>)>,
+}
+
+impl SavedFds {
+    fn save(&mut self, fd: i32) {
+        if fd < 0 || self.fds.iter().any(|(saved_fd, _)| *saved_fd == fd) {
+            return;
+        }
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd >= 0 {
+            let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+            self.fds.push((fd, Some(owned)));
+        } else if io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            self.fds.push((fd, None));
+        }
+    }
 }
 
 struct ScopeGuard {
@@ -339,6 +393,7 @@ fn exec_command(args: &[String], foreground: bool) -> i32 {
         "source" | "." => builtin_source(&args[1..]),
         "pwd" => builtin_pwd(&args[1..]),
         "echo" => builtin_echo(&args[1..]),
+        ":" => 0,
         "true" => 0,
         "false" => 1,
         "test" | "[" => builtin_test(&args[1..]),
@@ -350,7 +405,7 @@ fn exec_command(args: &[String], foreground: bool) -> i32 {
         "setopt" => builtin_setopt(&args[1..]),
         "unsetopt" => builtin_unsetopt(&args[1..]),
         "unset" => builtin_unset(&args[1..]),
-        "zstyle" => 0,
+        "zstyle" => builtin_zstyle(&args[1..]),
         "add-zsh-hook" => 0,
         "autoload" => builtin_autoload(&args[1..]),
         "compinit" | "compdef" | "compaudit" => 0,
@@ -361,9 +416,12 @@ fn exec_command(args: &[String], foreground: bool) -> i32 {
         "read" => builtin_read(&args[1..]),
         "shift" => builtin_shift(&args[1..]),
         "local" => builtin_local(&args[1..]),
+        "typeset" | "declare" => builtin_typeset(&args[1..]),
         "type" => builtin_type(&args[1..]),
         "kill" => builtin_kill(&args[1..]),
         "wait" => builtin_wait(&args[1..]),
+        "break" => builtin_break(&args[1..]),
+        "continue" => builtin_continue(&args[1..]),
         "umask" => builtin_umask(&args[1..]),
         "return" => builtin_return(&args[1..]),
         "eval" => builtin_eval(&args[1..]),
@@ -560,6 +618,9 @@ fn exec_list(node: &ASTNode) -> i32 {
     for n in &node.pipes {
         status = exec_node(n);
         SHELL.shell.lock().unwrap().last_status = status;
+        if loop_control_active() {
+            break;
+        }
         if status != 0 {
             let opts = SHELL.shell.lock().unwrap().opts;
             if opts & crate::types::OPT_ERREXIT != 0 {
@@ -588,6 +649,9 @@ fn exec_if(node: &ASTNode) -> i32 {
 }
 
 fn exec_while(node: &ASTNode) -> i32 {
+    SHELL.shell.lock().unwrap().loop_depth += 1;
+    let _guard = LoopDepthGuard;
+
     loop {
         let status = if let Some(ref cond) = node.cond {
             exec_node(cond)
@@ -605,10 +669,22 @@ fn exec_while(node: &ASTNode) -> i32 {
         if let Some(ref body) = node.body {
             exec_node(body);
         }
+        if consume_break_for_current_loop() {
+            return 0;
+        }
+        if let Some(continue_current_loop) = consume_continue_for_current_loop() {
+            if continue_current_loop {
+                continue;
+            }
+            return 0;
+        }
     }
 }
 
 fn exec_for(node: &ASTNode) -> i32 {
+    SHELL.shell.lock().unwrap().loop_depth += 1;
+    let _guard = LoopDepthGuard;
+
     let words: Vec<String> = if node.loop_words.is_empty() {
         SHELL.shell.lock().unwrap().pos_params.clone()
     } else {
@@ -623,8 +699,49 @@ fn exec_for(node: &ASTNode) -> i32 {
         if let Some(ref body) = node.body {
             exec_node(body);
         }
+        if consume_break_for_current_loop() {
+            return 0;
+        }
+        if let Some(continue_current_loop) = consume_continue_for_current_loop() {
+            if continue_current_loop {
+                continue;
+            }
+            return 0;
+        }
     }
     0
+}
+
+struct LoopDepthGuard;
+
+impl Drop for LoopDepthGuard {
+    fn drop(&mut self) {
+        let mut shell = SHELL.shell.lock().unwrap();
+        shell.loop_depth = shell.loop_depth.saturating_sub(1);
+    }
+}
+
+fn loop_control_active() -> bool {
+    let shell = SHELL.shell.lock().unwrap();
+    shell.break_count > 0 || shell.continue_count > 0
+}
+
+fn consume_break_for_current_loop() -> bool {
+    let mut shell = SHELL.shell.lock().unwrap();
+    if shell.break_count == 0 {
+        return false;
+    }
+    shell.break_count -= 1;
+    true
+}
+
+fn consume_continue_for_current_loop() -> Option<bool> {
+    let mut shell = SHELL.shell.lock().unwrap();
+    if shell.continue_count == 0 {
+        return None;
+    }
+    shell.continue_count -= 1;
+    Some(shell.continue_count == 0)
 }
 
 // Expands a single `for ... in <word>` token into the list of values it
@@ -661,6 +778,42 @@ fn expand_loop_word(w: &str) -> Vec<String> {
         }
     }
     vec![expand_all(w)]
+}
+
+fn expand_array_items(items: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        let stripped = if (item.starts_with('"') && item.ends_with('"') && item.len() >= 2)
+            || (item.starts_with('\'') && item.ends_with('\'') && item.len() >= 2)
+        {
+            &item[1..item.len() - 1]
+        } else {
+            item
+        };
+        if let Some(name) = stripped.strip_prefix('$') {
+            if !name.contains(['{', '[', '(', '$']) {
+                if let Some(arr) = crate::shell::array_get(name) {
+                    out.extend(arr);
+                    continue;
+                }
+            }
+        }
+        if let Some(rest) = stripped.strip_prefix("${") {
+            if let Some(inner) = rest.strip_suffix('}') {
+                if inner.ends_with("[@]") || inner.ends_with("[*]") {
+                    if let Some(open) = inner.find('[') {
+                        let name = &inner[..open];
+                        if let Some(arr) = crate::shell::array_get(name) {
+                            out.extend(arr);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(expand_all(item));
+    }
+    out
 }
 
 fn exec_function(node: &ASTNode) -> i32 {
@@ -742,7 +895,11 @@ fn dbracket_primary(toks: &[String], pos: usize) -> (bool, usize) {
     }
     if toks[pos] == "(" {
         let (v, p) = dbracket_or(toks, pos + 1);
-        let p = if p < toks.len() && toks[p] == ")" { p + 1 } else { p };
+        let p = if p < toks.len() && toks[p] == ")" {
+            p + 1
+        } else {
+            p
+        };
         return (v, p);
     }
     let unary_ops = [
@@ -925,9 +1082,21 @@ fn builtin_set(args: &[String]) -> i32 {
         }
         return 0;
     }
+    if args[0] == "--" {
+        SHELL.shell.lock().unwrap().pos_params = args[1..].to_vec();
+        return 0;
+    }
+    if !args[0].starts_with('-') && !args[0].starts_with('+') {
+        SHELL.shell.lock().unwrap().pos_params = args.to_vec();
+        return 0;
+    }
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if arg == "-" {
+            i += 1;
+            continue;
+        }
         if arg.starts_with('-') || arg.starts_with('+') {
             let turn_on = arg.starts_with('-');
             for c in arg.chars().skip(1) {
@@ -948,6 +1117,10 @@ fn builtin_set(args: &[String]) -> i32 {
                     }
                 }
             }
+        }
+        if i + 1 < args.len() && !args[i + 1].starts_with('-') && !args[i + 1].starts_with('+') {
+            SHELL.shell.lock().unwrap().pos_params = args[i + 1..].to_vec();
+            break;
         }
         i += 1;
     }
@@ -991,7 +1164,9 @@ fn builtin_autoload(args: &[String]) -> i32 {
             body.body = Some(Box::new(ASTNode::new("empty")));
             SHELL.shell.lock().unwrap().functions.insert(
                 arg.clone(),
-                crate::types::FuncDef { body: std::sync::Arc::new(body) },
+                crate::types::FuncDef {
+                    body: std::sync::Arc::new(body),
+                },
             );
         }
     }
@@ -1063,7 +1238,11 @@ fn builtin_unsetopt(args: &[String]) -> i32 {
 }
 
 fn toggle_named_opt(name: &str, value: bool) {
-    let normalized: String = name.to_ascii_lowercase().chars().filter(|c| *c != '_').collect();
+    let normalized: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '_')
+        .collect();
     let mut shell = SHELL.shell.lock().unwrap();
     shell.named_opts.insert(normalized.clone(), value);
     let opt_flag = match normalized.as_str() {
@@ -1149,11 +1328,24 @@ fn builtin_read(args: &[String]) -> i32 {
     0
 }
 
-fn builtin_shift(_args: &[String]) -> i32 {
+fn builtin_shift(args: &[String]) -> i32 {
+    let count = if args.is_empty() {
+        1
+    } else {
+        match args[0].parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("meowsh: shift: bad number");
+                return 1;
+            }
+        }
+    };
     let mut shell = SHELL.shell.lock().unwrap();
-    if !shell.pos_params.is_empty() {
-        shell.pos_params.remove(0);
+    if count > shell.pos_params.len() {
+        eprintln!("meowsh: shift: can't shift that many");
+        return 1;
     }
+    shell.pos_params.drain(0..count);
     0
 }
 
@@ -1176,13 +1368,276 @@ fn builtin_local(args: &[String]) -> i32 {
         }
         declare_local(&name);
         match value {
-            Some(v) => var_set(&name, &v, false),
+            Some(v) => {
+                var_set(&name, &v, false);
+            }
             // Bare `local foo` masks any existing global with an empty
             // value for the duration of the function.
-            None => var_set(&name, "", false),
+            None => {
+                var_set(&name, "", false);
+            }
         }
     }
     0
+}
+
+fn builtin_typeset(args: &[String]) -> i32 {
+    let mut export = false;
+    let mut readonly = false;
+    let mut unique = false;
+    let mut array = false;
+    let mut associative = false;
+    let mut print = false;
+    let mut names = Vec::new();
+
+    for arg in args {
+        if arg == "--" {
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 && !arg.contains('=') {
+            for flag in arg.chars().skip(1) {
+                match flag {
+                    'a' => array = true,
+                    'A' => associative = true,
+                    'g' => {}
+                    'r' => readonly = true,
+                    'U' => unique = true,
+                    'x' => export = true,
+                    'p' => print = true,
+                    // Common zsh modifiers such as -h/-m/-u don't affect the
+                    // storage model here, so accept them for startup-file
+                    // compatibility.
+                    'h' | 'i' | 'l' | 'm' | 't' | 'u' | 'z' => {}
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if arg.starts_with('+') && arg.len() > 1 && !arg.contains('=') {
+            for flag in arg.chars().skip(1) {
+                match flag {
+                    'x' => export = false,
+                    'r' => readonly = false,
+                    'U' => unique = false,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        names.push(arg.clone());
+    }
+
+    if print || names.is_empty() {
+        print_typeset_state(&names);
+        return 0;
+    }
+
+    for spec in names {
+        let (name, value) = match spec.find('=') {
+            Some(idx) => (&spec[..idx], Some(&spec[idx + 1..])),
+            None => (spec.as_str(), None),
+        };
+        if name.is_empty() || !is_valid_name(name) {
+            eprintln!("meowsh: typeset: `{}': not a valid identifier", spec);
+            return 1;
+        }
+        if array && !array_declare(name) {
+            return 1;
+        }
+        if associative && !assoc_declare(name) {
+            return 1;
+        }
+        if unique && !array_make_unique(name) {
+            return 1;
+        }
+        if let Some(value) = value {
+            let expanded = expand_all(value);
+            var_set(name, &expanded, export);
+        } else if export {
+            let value = var_get(name);
+            var_set(name, &value, true);
+        }
+        if readonly {
+            let mut shell = SHELL.shell.lock().unwrap();
+            if let Some(var) = shell.vars.get_mut(name) {
+                var.flags |= crate::types::VAR_READONLY;
+            }
+        }
+    }
+    0
+}
+
+fn builtin_zstyle(args: &[String]) -> i32 {
+    if args.is_empty() {
+        return 0;
+    }
+
+    match args[0].as_str() {
+        "-L" => {
+            print_zstyles(&args[1..]);
+            0
+        }
+        "-s" => {
+            if args.len() < 4 {
+                return 1;
+            }
+            if let Some(values) = zstyle_lookup(&args[1], &args[2]) {
+                var_set(&args[3], &values.join(" "), false);
+                0
+            } else {
+                1
+            }
+        }
+        "-a" => {
+            if args.len() < 4 {
+                return 1;
+            }
+            if let Some(values) = zstyle_lookup(&args[1], &args[2]) {
+                if crate::shell::array_set(&args[3], values) {
+                    0
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        }
+        "-b" => {
+            if args.len() < 4 {
+                return 1;
+            }
+            let value = zstyle_lookup(&args[1], &args[2])
+                .map(|values| zstyle_truthy(&values))
+                .unwrap_or(false);
+            var_set(&args[3], if value { "yes" } else { "no" }, false);
+            if value {
+                0
+            } else {
+                1
+            }
+        }
+        "-t" => {
+            if args.len() < 3 {
+                return 1;
+            }
+            zstyle_lookup(&args[1], &args[2])
+                .map(|values| if zstyle_truthy(&values) { 0 } else { 1 })
+                .unwrap_or(1)
+        }
+        _ => {
+            if args.len() < 2 {
+                return 1;
+            }
+            let entry = ZStyle {
+                pattern: args[0].clone(),
+                matcher: glob::Pattern::new(&args[0]).ok(),
+                style: args[1].clone(),
+                values: args[2..].to_vec(),
+            };
+            let mut shell = SHELL.shell.lock().unwrap();
+            if let Some(existing) = shell
+                .zstyles
+                .iter_mut()
+                .find(|z| z.pattern == entry.pattern && z.style == entry.style)
+            {
+                *existing = entry;
+            } else {
+                shell.zstyles.push(entry);
+            }
+            0
+        }
+    }
+}
+
+fn zstyle_lookup(context: &str, style: &str) -> Option<Vec<String>> {
+    let shell = SHELL.shell.lock().unwrap();
+    shell
+        .zstyles
+        .iter()
+        .rev()
+        .find(|entry| entry.style == style && zstyle_pattern_matches(entry, context))
+        .map(|entry| entry.values.clone())
+}
+
+fn zstyle_pattern_matches(entry: &ZStyle, context: &str) -> bool {
+    if entry.pattern == context {
+        return true;
+    }
+    entry
+        .matcher
+        .as_ref()
+        .map(|p| p.matches(context))
+        .unwrap_or(false)
+}
+
+fn zstyle_truthy(values: &[String]) -> bool {
+    let first = values.first().map(|s| s.to_ascii_lowercase());
+    matches!(
+        first.as_deref(),
+        Some("yes") | Some("true") | Some("on") | Some("1")
+    )
+}
+
+fn print_zstyles(filters: &[String]) {
+    let shell = SHELL.shell.lock().unwrap();
+    for entry in &shell.zstyles {
+        if !filters.is_empty()
+            && !filters
+                .iter()
+                .any(|f| f == &entry.pattern || f == &entry.style)
+        {
+            continue;
+        }
+        if entry.values.is_empty() {
+            println!("zstyle {} {}", entry.pattern, entry.style);
+        } else {
+            println!(
+                "zstyle {} {} {}",
+                entry.pattern,
+                entry.style,
+                entry.values.join(" ")
+            );
+        }
+    }
+}
+
+fn print_typeset_state(names: &[String]) {
+    let shell = SHELL.shell.lock().unwrap();
+    if names.is_empty() {
+        let mut vars: Vec<_> = shell.vars.iter().collect();
+        vars.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, var) in vars {
+            println!("typeset {}={}", name, var.value);
+        }
+        let mut arrays: Vec<_> = shell.arrays.iter().collect();
+        arrays.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, items) in arrays {
+            println!("typeset -a {}=({})", name, items.join(" "));
+        }
+        let mut assoc_arrays: Vec<_> = shell.assoc_arrays.iter().collect();
+        assoc_arrays.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, items) in assoc_arrays {
+            let pairs: Vec<String> = items
+                .iter()
+                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .collect();
+            println!("typeset -A {}=({})", name, pairs.join(" "));
+        }
+        return;
+    }
+    for name in names {
+        if let Some(items) = shell.arrays.get(name) {
+            println!("typeset -a {}=({})", name, items.join(" "));
+        } else if let Some(items) = shell.assoc_arrays.get(name) {
+            let pairs: Vec<String> = items
+                .iter()
+                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .collect();
+            println!("typeset -A {}=({})", name, pairs.join(" "));
+        } else if let Some(var) = shell.vars.get(name) {
+            println!("typeset {}={}", name, var.value);
+        }
+    }
 }
 
 fn is_valid_name(s: &str) -> bool {
@@ -1201,8 +1656,9 @@ fn builtin_type(args: &[String]) -> i32 {
 
     let name = &args[0];
     let builtins = vec![
-        "cd", "echo", "exit", "pwd", "test", "true", "false", "export", "set", "unset", "alias",
-        "unalias", "read", "source", "jobs", "fg", "bg", "type", "kill", "wait",
+        ":", "cd", "echo", "exit", "pwd", "test", "true", "false", "export", "set", "unset",
+        "alias", "unalias", "read", "source", "jobs", "fg", "bg", "typeset", "declare", "type",
+        "kill", "wait", "break", "continue",
     ];
     if builtins.contains(&name.as_str()) {
         println!("{} is a shell builtin", name);
@@ -1246,6 +1702,49 @@ fn builtin_wait(_args: &[String]) -> i32 {
         if pid <= 0 {
             break;
         }
+    }
+    0
+}
+
+fn builtin_break(args: &[String]) -> i32 {
+    set_loop_control(args, true)
+}
+
+fn builtin_continue(args: &[String]) -> i32 {
+    set_loop_control(args, false)
+}
+
+fn set_loop_control(args: &[String], is_break: bool) -> i32 {
+    let count = if args.is_empty() {
+        1
+    } else {
+        match args[0].parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "meowsh: {}: bad loop count",
+                    if is_break { "break" } else { "continue" }
+                );
+                return 1;
+            }
+        }
+    };
+
+    let mut shell = SHELL.shell.lock().unwrap();
+    if shell.loop_depth == 0 {
+        eprintln!(
+            "meowsh: {}: only meaningful in a loop",
+            if is_break { "break" } else { "continue" }
+        );
+        return 1;
+    }
+    let count = count.min(shell.loop_depth);
+    if is_break {
+        shell.break_count = count;
+        shell.continue_count = 0;
+    } else {
+        shell.continue_count = count;
+        shell.break_count = 0;
     }
     0
 }
@@ -1306,6 +1805,18 @@ fn builtin_readonly(args: &[String]) -> i32 {
     for arg in args {
         if let Some(idx) = arg.find('=') {
             let (name, value) = arg.split_at(idx);
+            if SHELL
+                .shell
+                .lock()
+                .unwrap()
+                .vars
+                .get(name)
+                .map(|v| v.flags & crate::types::VAR_READONLY != 0)
+                .unwrap_or(false)
+            {
+                eprintln!("meowsh: {}: readonly variable", name);
+                return 1;
+            }
             let flags = crate::types::VAR_READONLY;
             SHELL.shell.lock().unwrap().vars.insert(
                 name.to_string(),
@@ -1337,11 +1848,69 @@ fn builtin_test(args: &[String]) -> i32 {
             "-d" => return if path.is_dir() { 0 } else { 1 },
             "-e" => return if path.exists() { 0 } else { 1 },
             "-f" => return if path.is_file() { 0 } else { 1 },
-            "-s" => return if path.metadata().map(|m| m.len() > 0).unwrap_or(false) { 0 } else { 1 },
-            "-h" | "-L" => return if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) { 0 } else { 1 },
-            "-r" => return unsafe { if libc::access(std::ffi::CString::new(path_str.as_bytes()).unwrap_or_default().as_ptr(), libc::R_OK) == 0 { 0 } else { 1 } },
-            "-w" => return unsafe { if libc::access(std::ffi::CString::new(path_str.as_bytes()).unwrap_or_default().as_ptr(), libc::W_OK) == 0 { 0 } else { 1 } },
-            "-x" => return unsafe { if libc::access(std::ffi::CString::new(path_str.as_bytes()).unwrap_or_default().as_ptr(), libc::X_OK) == 0 { 0 } else { 1 } },
+            "-s" => {
+                return if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                    0
+                } else {
+                    1
+                }
+            }
+            "-h" | "-L" => {
+                return if path
+                    .symlink_metadata()
+                    .map(|m| m.is_symlink())
+                    .unwrap_or(false)
+                {
+                    0
+                } else {
+                    1
+                }
+            }
+            "-r" => {
+                return unsafe {
+                    if libc::access(
+                        std::ffi::CString::new(path_str.as_bytes())
+                            .unwrap_or_default()
+                            .as_ptr(),
+                        libc::R_OK,
+                    ) == 0
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                }
+            }
+            "-w" => {
+                return unsafe {
+                    if libc::access(
+                        std::ffi::CString::new(path_str.as_bytes())
+                            .unwrap_or_default()
+                            .as_ptr(),
+                        libc::W_OK,
+                    ) == 0
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                }
+            }
+            "-x" => {
+                return unsafe {
+                    if libc::access(
+                        std::ffi::CString::new(path_str.as_bytes())
+                            .unwrap_or_default()
+                            .as_ptr(),
+                        libc::X_OK,
+                    ) == 0
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                }
+            }
             _ => return 1,
         }
     }
@@ -1463,11 +2032,17 @@ mod tests {
         let mut shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
         shell.vars.clear();
         shell.arrays.clear();
+        shell.assoc_arrays.clear();
+        shell.unique_arrays.clear();
+        shell.zstyles.clear();
         shell.functions.clear();
         shell.local_scopes.clear();
         shell.aliases.clear();
         shell.pos_params.clear();
         shell.last_status = 0;
+        shell.loop_depth = 0;
+        shell.break_count = 0;
+        shell.continue_count = 0;
     }
 
     #[test]
@@ -1487,9 +2062,11 @@ mod tests {
         execute_line("function f { local x=inner; }");
         execute_line("f");
         let shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(shell.vars.get("x").is_none(),
+        assert!(
+            shell.vars.get("x").is_none(),
             "x should not exist after function returns; got {:?}",
-            shell.vars.get("x").map(|v| &v.value));
+            shell.vars.get("x").map(|v| &v.value)
+        );
     }
 
     #[test]
@@ -1546,8 +2123,10 @@ mod tests {
         execute_line("function f { local newvar=hi; }");
         execute_line("f");
         let shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(shell.vars.get("newvar").is_none(),
-            "newvar should be unset after function returns");
+        assert!(
+            shell.vars.get("newvar").is_none(),
+            "newvar should be unset after function returns"
+        );
     }
 
     #[test]
@@ -1557,7 +2136,10 @@ mod tests {
         execute_line("function f { y=set_inside; }");
         execute_line("f");
         let shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(shell.vars.get("y").map(|v| v.value.as_str()), Some("set_inside"));
+        assert_eq!(
+            shell.vars.get("y").map(|v| v.value.as_str()),
+            Some("set_inside")
+        );
     }
 
     #[test]

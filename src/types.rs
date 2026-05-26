@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub const OPT_ALLEXPORT: u32 = 1 << 0;
@@ -35,6 +35,14 @@ pub enum ProcState {
 pub struct Var {
     pub value: String,
     pub flags: u32,
+}
+
+#[derive(Clone)]
+pub struct ZStyle {
+    pub pattern: String,
+    pub matcher: Option<glob::Pattern>,
+    pub style: String,
+    pub values: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -83,6 +91,9 @@ pub struct Shell {
     pub trap: HashMap<String, String>,
     pub functions: HashMap<String, FuncDef>,
     pub lineno: i32,
+    pub loop_depth: usize,
+    pub break_count: usize,
+    pub continue_count: usize,
     // Stack of local-variable scopes. Each entry maps a variable name to
     // its prior global value (None = the variable was unset before being
     // declared local). Pushed on function entry, popped on return.
@@ -91,9 +102,16 @@ pub struct Shell {
     // lowercase with underscores stripped. Most are stubs for Phase 1;
     // the subset that maps to a legacy OPT_* flag also toggles that flag.
     pub named_opts: HashMap<String, bool>,
+    // zstyle entries in declaration order. Later matching entries override
+    // earlier ones for query operations.
+    pub zstyles: Vec<ZStyle>,
     // Indexed arrays (zsh-style, 1-based at the user level). Stored 0-based.
     // A name that exists in `arrays` shadows any same-named scalar in `vars`.
     pub arrays: HashMap<String, Vec<String>>,
+    // Associative arrays declared with `typeset -A`.
+    pub assoc_arrays: HashMap<String, BTreeMap<String, String>>,
+    // Arrays declared with `typeset -U` keep first occurrences only.
+    pub unique_arrays: HashSet<String>,
 }
 
 impl Shell {
@@ -120,9 +138,15 @@ impl Shell {
             trap: HashMap::new(),
             functions: HashMap::new(),
             lineno: 0,
+            loop_depth: 0,
+            break_count: 0,
+            continue_count: 0,
             local_scopes: Vec::new(),
             named_opts: HashMap::new(),
+            zstyles: Vec::new(),
             arrays: HashMap::new(),
+            assoc_arrays: HashMap::new(),
+            unique_arrays: HashSet::new(),
         }
     }
 }
@@ -207,6 +231,8 @@ pub struct ASTNode {
     pub array_assigns: HashMap<String, Vec<String>>,
     // Array append: `arr+=(d e f)`.
     pub array_appends: HashMap<String, Vec<String>>,
+    // Subscript assignment: `arr[key]=value` / `arr[key]+=value`.
+    pub subscript_assigns: Vec<(String, String, String, bool)>,
     pub redirs: Vec<Redir>,
     pub cond: Option<Box<ASTNode>>,
     pub body: Option<Box<ASTNode>>,
@@ -233,6 +259,7 @@ impl ASTNode {
             scalar_appends: HashMap::new(),
             array_assigns: HashMap::new(),
             array_appends: HashMap::new(),
+            subscript_assigns: Vec::new(),
             redirs: Vec::new(),
             cond: None,
             body: None,
