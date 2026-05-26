@@ -1,5 +1,6 @@
 use crate::shell::{
-    array_get, assoc_get, assoc_keys, assoc_values, var_get, var_get_if_exists, var_set, SHELL,
+    array_get, assoc_get, assoc_keys, assoc_values, var_exists, var_get, var_get_if_exists,
+    var_set, SHELL,
 };
 use std::process::Command;
 
@@ -386,6 +387,18 @@ pub fn expand_variable(s: &str) -> String {
 }
 
 pub fn expand_var_expr(expr: &str) -> String {
+    if let Some(name) = expr.strip_prefix('+') {
+        return if var_exists(name) { "1" } else { "0" }.to_string();
+    }
+    if let Some(name) = expr.strip_prefix('!') {
+        let target = var_get(name);
+        return if !target.is_empty() {
+            var_get(&target)
+        } else {
+            String::new()
+        };
+    }
+
     if let Some(rest) = expr.strip_prefix("(k)") {
         if let Some(keys) = assoc_keys(rest) {
             return keys.join(" ");
@@ -438,8 +451,12 @@ pub fn expand_var_expr(expr: &str) -> String {
         return result;
     }
 
+    if let Some(result) = try_substring(expr) {
+        return result;
+    }
+
     let ops = vec![
-        ":-", ":=", ":?", ":-", "-", "=", "?", "+", "%%", "%", "##", "#",
+        ":-", ":=", ":?", ":+", "-", "=", "?", "+", "%%", "%", "##", "#",
     ];
 
     fn expand_pattern(word: &str) -> String {
@@ -515,6 +532,35 @@ pub fn expand_var_expr(expr: &str) -> String {
     }
 
     var_get(expr)
+}
+
+// `${var:offset}` and `${var:offset:length}`. This intentionally avoids
+// `:-`, `:=`, `:?`, and `:+`, which are handled by the default-value operator
+// parser below.
+fn try_substring(expr: &str) -> Option<String> {
+    let colon = expr.find(':')?;
+    let name = &expr[..colon];
+    if name.is_empty()
+        || name.contains(|c: char| matches!(c, ':' | '#' | '%' | '/' | '?' | '+' | '-' | '='))
+    {
+        return None;
+    }
+    let spec = &expr[colon + 1..];
+    if spec.starts_with(['-', '=', '?', '+']) {
+        return None;
+    }
+    let mut parts = spec.splitn(2, ':');
+    let offset = parts.next()?.trim().parse::<isize>().ok()?;
+    let length = parts.next().and_then(|s| s.trim().parse::<usize>().ok());
+    let value = var_get(name);
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len() as isize;
+    let start = if offset >= 0 { offset } else { len + offset };
+    let start = start.clamp(0, len) as usize;
+    let end = length
+        .map(|n| start.saturating_add(n).min(chars.len()))
+        .unwrap_or(chars.len());
+    Some(chars[start..end].iter().collect())
 }
 
 // Splits `name[subscript]` into (name, subscript) if the expression has the

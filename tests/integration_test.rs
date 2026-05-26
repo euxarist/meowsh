@@ -227,6 +227,132 @@ fn test_parameter_expansion_remove_prefix() {
 }
 
 #[test]
+fn test_parameter_expansion_substring() {
+    let (status, stdout, _) = run_script(r#"name=meowsh; echo "${name:0:4}"; echo "${name:4}""#);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["meow", "sh"]);
+}
+
+#[test]
+fn test_parameter_expansion_indirect_and_set_test() {
+    let (status, stdout, _) =
+        run_script(r#"target=answer; answer=42; echo "${!target}"; echo "${+answer}:${+missing}""#);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines, vec!["42", "1:0"]);
+}
+
+#[test]
+fn test_parameter_expansion_special_and_positional_set_test() {
+    let (status, stdout, _) = run_script(r#"set -- alpha; echo "${+?}:${+1}:${+2}""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "1:1:0");
+}
+
+#[test]
+fn test_parameter_expansion_empty_indirect_is_empty() {
+    let (status, stdout, _) = run_script(r#"unset target; echo "x${!target}y""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "xy");
+}
+
+#[test]
+fn test_parameter_expansion_alt_value_colon_plus() {
+    let (status, stdout, _) =
+        run_script(r#"set=present; empty=; echo "${set:+yes}:${empty:+no}:${missing:+no}""#);
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "yes::");
+}
+
+#[test]
+fn test_cd_dash_updates_oldpwd() {
+    let temp_dir = TempDir::new().unwrap();
+    let a = temp_dir.path().join("a");
+    let b = temp_dir.path().join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let script = format!(
+        r#"cd "{}"; cd "{}"; cd -; pwd; echo "old=$OLDPWD""#,
+        a.display(),
+        b.display()
+    );
+    let (status, stdout, _) = run_script(&script);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines[0], a.to_string_lossy());
+    assert_eq!(lines[1], a.to_string_lossy());
+    assert_eq!(lines[2], format!("old={}", b.display()));
+}
+
+#[test]
+fn test_pushd_popd_dirs() {
+    let temp_dir = TempDir::new().unwrap();
+    let a = temp_dir.path().join("a");
+    let b = temp_dir.path().join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let script = format!(
+        r#"cd "{}"; pushd "{}"; dirs; popd; pwd"#,
+        a.display(),
+        b.display()
+    );
+    let (status, stdout, _) = run_script(&script);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines[0], format!("{} {}", b.display(), a.display()));
+    assert_eq!(lines[1], format!("{} {}", b.display(), a.display()));
+    assert_eq!(lines[2], a.to_string_lossy());
+    assert_eq!(lines[3], a.to_string_lossy());
+}
+
+#[test]
+fn test_failed_pushd_without_args_restores_stack() {
+    let temp_dir = TempDir::new().unwrap();
+    let a = temp_dir.path().join("a");
+    let b = temp_dir.path().join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let script = format!(
+        r#"cd "{}"; pushd "{}"; /bin/rmdir "{}"; pushd; echo "status=$?"; dirs"#,
+        a.display(),
+        b.display(),
+        a.display()
+    );
+    let (status, stdout, _) = run_script(&script);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines[lines.len() - 2], "status=1");
+    assert_eq!(
+        lines[lines.len() - 1],
+        format!("{} {}", b.display(), a.display())
+    );
+}
+
+#[test]
+fn test_failed_popd_restores_stack() {
+    let temp_dir = TempDir::new().unwrap();
+    let a = temp_dir.path().join("a");
+    let b = temp_dir.path().join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let script = format!(
+        r#"cd "{}"; pushd "{}"; /bin/rmdir "{}"; popd; echo "status=$?"; dirs"#,
+        a.display(),
+        b.display(),
+        a.display()
+    );
+    let (status, stdout, _) = run_script(&script);
+    assert_eq!(status, 0);
+    let lines: Vec<&str> = stdout.trim().split('\n').collect();
+    assert_eq!(lines[lines.len() - 2], "status=1");
+    assert_eq!(
+        lines[lines.len() - 1],
+        format!("{} {}", b.display(), a.display())
+    );
+}
+
+#[test]
 fn test_history_builtin() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .arg("-i")

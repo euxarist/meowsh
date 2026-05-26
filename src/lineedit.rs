@@ -66,10 +66,10 @@ impl MeowshHelper {
             }
 
             let builtins = [
-                "exit", "cd", "source", "pwd", "echo", "true", "false", "test", "[", "jobs", "fg",
-                "bg", "export", "set", "unset", "alias", "unalias", "read", "shift", "local",
-                "typeset", "declare", "type", "kill", "wait", "break", "continue", "umask",
-                "return", "eval", "trap", "ulimit", "readonly", "history",
+                "exit", "cd", "pushd", "popd", "dirs", "source", "pwd", "echo", "true", "false",
+                "test", "[", "jobs", "fg", "bg", "export", "set", "unset", "alias", "unalias",
+                "read", "shift", "local", "typeset", "declare", "type", "kill", "wait", "break",
+                "continue", "umask", "return", "eval", "trap", "ulimit", "readonly", "history",
             ];
             for b in builtins {
                 if self.fuzzy_match(current, b) {

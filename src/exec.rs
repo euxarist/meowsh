@@ -390,6 +390,9 @@ fn exec_command(args: &[String], foreground: bool) -> i32 {
     let status = match name.as_str() {
         "exit" => builtin_exit(&args[1..]),
         "cd" => builtin_cd(&args[1..]),
+        "pushd" => builtin_pushd(&args[1..]),
+        "popd" => builtin_popd(&args[1..]),
+        "dirs" => builtin_dirs(&args[1..]),
         "source" | "." => builtin_source(&args[1..]),
         "pwd" => builtin_pwd(&args[1..]),
         "echo" => builtin_echo(&args[1..]),
@@ -982,6 +985,13 @@ fn builtin_exit(args: &[String]) -> i32 {
 fn builtin_cd(args: &[String]) -> i32 {
     let dir = if args.is_empty() {
         var_get("HOME")
+    } else if args[0] == "-" {
+        let oldpwd = var_get("OLDPWD");
+        if oldpwd.is_empty() {
+            eprintln!("meowsh: cd: OLDPWD not set");
+            return 1;
+        }
+        oldpwd
     } else {
         args[0].clone()
     };
@@ -991,13 +1001,90 @@ fn builtin_cd(args: &[String]) -> i32 {
 
     let expanded = expand_all(&dir);
     if Path::new(&expanded).is_dir() {
-        env::set_current_dir(&expanded).ok();
-        var_set("PWD", &expanded, false);
+        let old_pwd = env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| var_get("PWD"));
+        if let Err(e) = env::set_current_dir(&expanded) {
+            eprintln!("meowsh: cd: {}: {}", expanded, e);
+            return 1;
+        }
+        let new_pwd = env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(expanded);
+        var_set("OLDPWD", &old_pwd, false);
+        var_set("PWD", &new_pwd, false);
+        if args.first().map(|s| s.as_str()) == Some("-") {
+            println!("{}", new_pwd);
+        }
         0
     } else {
         eprintln!("meowsh: cd: {}: No such file or directory", expanded);
         1
     }
+}
+
+fn builtin_pushd(args: &[String]) -> i32 {
+    let mut popped = None;
+    let target = if args.is_empty() {
+        let prev = SHELL.shell.lock().unwrap().dir_stack.pop();
+        match prev {
+            Some(dir) => {
+                popped = Some(dir.clone());
+                dir
+            }
+            None => {
+                eprintln!("meowsh: pushd: directory stack empty");
+                return 1;
+            }
+        }
+    } else {
+        args[0].clone()
+    };
+    let old_pwd = env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| var_get("PWD"));
+    let status = builtin_cd(&[target]);
+    if status == 0 {
+        SHELL.shell.lock().unwrap().dir_stack.push(old_pwd);
+        print_dirs();
+    } else if let Some(dir) = popped {
+        SHELL.shell.lock().unwrap().dir_stack.push(dir);
+    }
+    status
+}
+
+fn builtin_popd(_args: &[String]) -> i32 {
+    let target = {
+        let mut shell = SHELL.shell.lock().unwrap();
+        shell.dir_stack.pop()
+    };
+    let Some(target) = target else {
+        eprintln!("meowsh: popd: directory stack empty");
+        return 1;
+    };
+    let status = builtin_cd(std::slice::from_ref(&target));
+    if status == 0 {
+        print_dirs();
+    } else {
+        SHELL.shell.lock().unwrap().dir_stack.push(target);
+    }
+    status
+}
+
+fn builtin_dirs(_args: &[String]) -> i32 {
+    print_dirs();
+    0
+}
+
+fn print_dirs() {
+    let mut dirs = Vec::new();
+    dirs.push(var_get("PWD"));
+    let stack = SHELL.shell.lock().unwrap().dir_stack.clone();
+    dirs.extend(stack.into_iter().rev());
+    println!("{}", dirs.join(" "));
 }
 
 fn builtin_source(args: &[String]) -> i32 {
@@ -1656,9 +1743,9 @@ fn builtin_type(args: &[String]) -> i32 {
 
     let name = &args[0];
     let builtins = vec![
-        ":", "cd", "echo", "exit", "pwd", "test", "true", "false", "export", "set", "unset",
-        "alias", "unalias", "read", "source", "jobs", "fg", "bg", "typeset", "declare", "type",
-        "kill", "wait", "break", "continue",
+        ":", "cd", "pushd", "popd", "dirs", "echo", "exit", "pwd", "test", "true", "false",
+        "export", "set", "unset", "alias", "unalias", "read", "source", "jobs", "fg", "bg",
+        "typeset", "declare", "type", "kill", "wait", "break", "continue",
     ];
     if builtins.contains(&name.as_str()) {
         println!("{} is a shell builtin", name);

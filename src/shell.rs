@@ -190,6 +190,21 @@ pub fn var_get(name: &str) -> String {
     String::new()
 }
 
+pub fn var_exists(name: &str) -> bool {
+    let shell = SHELL.shell.lock().unwrap();
+    if matches!(name, "?" | "$" | "!" | "0" | "#" | "@" | "*" | "-") {
+        return true;
+    }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(idx) = name.parse::<usize>() {
+            return idx == 0 || idx <= shell.pos_params.len();
+        }
+    }
+    shell.vars.contains_key(name)
+        || shell.arrays.contains_key(name)
+        || shell.assoc_arrays.contains_key(name)
+}
+
 pub fn var_get_if_exists(name: &str) -> Option<i64> {
     let shell = SHELL.shell.lock().unwrap();
     if let Some(v) = shell.vars.get(name) {
@@ -825,6 +840,9 @@ pub fn command_exists(name: &str) -> bool {
         ":",
         "exit",
         "cd",
+        "pushd",
+        "popd",
+        "dirs",
         "source",
         ".",
         "pwd",
