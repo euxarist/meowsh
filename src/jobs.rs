@@ -8,6 +8,8 @@ fn status_to_exit(status: i32) -> i32 {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
         128 + libc::WTERMSIG(status) as i32
+    } else if libc::WIFSTOPPED(status) {
+        128 + libc::WSTOPSIG(status) as i32
     } else {
         0
     }
@@ -286,6 +288,13 @@ mod tests {
         assert_eq!(parse_job_id(&["3".to_string()]).unwrap(), Some(3));
         assert!(parse_job_id(&["%abc".to_string()]).is_err());
         assert!(parse_job_id(&["%1".to_string(), "%2".to_string()]).is_err());
+    }
+
+    #[test]
+    fn status_to_exit_reports_stopped_signal_status() {
+        let status = libc::W_STOPCODE(libc::SIGTSTP);
+
+        assert_eq!(status_to_exit(status), 128 + libc::SIGTSTP);
     }
 
     #[test]
