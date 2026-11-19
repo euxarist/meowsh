@@ -23,6 +23,11 @@ To build `meowsh` from source, run:
 make
 ```
 
+On Linux this produces a static musl binary matched to the host
+architecture; install the musl standard library once with
+`rustup target add $(uname -m)-unknown-linux-musl`. Set `TRIPLE=` for a
+plain host build, or `TRIPLE=<triple>` to build for another target.
+
 ## Usage
 
 After building, you can start the shell with:
