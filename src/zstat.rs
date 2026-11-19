@@ -84,7 +84,7 @@ fn format_time(sec: i64, raw: bool, sym: bool, gmt: bool, fmt: &str) -> String {
     if raw || !sym {
         return sec.to_string();
     }
-    let t = sec as libc::time_t;
+    let t = sec;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         if gmt {
