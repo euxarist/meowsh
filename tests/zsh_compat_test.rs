@@ -1903,6 +1903,25 @@ fn raw_bytes_multibyte_zstat_and_zformat_compat() {
 }
 
 #[test]
+fn zstat_type_name_flags_compat() {
+    // oh-my-zsh does `mtime=$(zstat +mtime f); (( mtime + 1 ))`, which recursed
+    // when a picked element printed as `mtime   <value>`.
+    let (st, out, err) = sh("zmodload -F zsh/stat b:zstat; f=/; \
+         m=$(zstat +mtime $f); (( m + 1 > 1 )) && print bare; \
+         zstat -t +nlink $f | sed 's/[0-9]*$/N/'; \
+         zstat +nlink $f $f | sed 's/[0-9]*$/N/'; \
+         zstat -T $f | head -1 | sed 's/[0-9]*$/N/'; \
+         zstat $f $f | sed -n '1p;2s/[0-9]*$/N/p'; \
+         zstat -t -A a +nlink $f; print -r -- \"${a%% *}\"; \
+         zstat -A a +nlink $f; [[ $a = <-> ]] && print num");
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(
+        out,
+        "bare\nnlink N\n/ N\n/ N\nN\n/:\ndevice  N\nnlink\nnum\n"
+    );
+}
+
+#[test]
 fn zwc_compile_and_invalid_description_compat() {
     use std::time::{Duration, UNIX_EPOCH};
     let dir = TempDir::new().unwrap();

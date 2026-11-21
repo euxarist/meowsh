@@ -150,7 +150,8 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
     let mut hash_name: Option<String> = None;
     let mut use_fd: Option<i32> = None;
     let mut timefmt = "%a %b %e %k:%M:%S %Z %Y".to_string();
-    let (mut gmt, mut lstat_flag, mut show_name, mut suppress_type) = (false, false, false, false);
+    let (mut gmt, mut lstat_flag, mut show_name) = (false, false, false);
+    let (mut show_type, mut hide_type) = (false, false);
     let (mut suppress_name, mut octal, mut raw, mut sym) = (false, false, false, false);
 
     let mut i = 1;
@@ -201,8 +202,8 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
                 'o' => octal = true,
                 'r' => raw = true,
                 's' => sym = true,
-                't' => suppress_type = true,
-                'T' => {}
+                't' => show_type = true,
+                'T' => hide_type = true,
                 'A' => match take(&mut i, &mut chars) {
                     Some(v) => {
                         arr_name = Some(v);
@@ -324,15 +325,24 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
             if hash_name.is_some() {
                 hash_map.insert(FIELDS[idx].to_string(), val);
             } else if arr_name.is_some() {
-                collected.push(val);
-            } else {
-                let prefix = if !suppress_type {
-                    format!("{:<8}", FIELDS[idx])
+                // Array elements carry the type name only on request (-t).
+                if show_type && !hide_type {
+                    collected.push(format!("{} {}", FIELDS[idx], val));
                 } else {
+                    collected.push(val);
+                }
+            } else {
+                // A single picked element prints bare so `x=$(zstat +mtime f)`
+                // yields a number; the full listing aligns type names instead.
+                let prefix = if hide_type || (pick.is_some() && !show_type) {
                     String::new()
+                } else if pick.is_some() {
+                    format!("{} ", FIELDS[idx])
+                } else {
+                    format!("{:<8}", FIELDS[idx])
                 };
-                if (multi && !suppress_name) || show_name {
-                    out(&format!("{}{} {}\n", prefix, target, val));
+                if pick.is_some() && ((multi && !suppress_name) || show_name) {
+                    out(&format!("{} {}{}\n", target, prefix, val));
                 } else {
                     out(&format!("{}{}\n", prefix, val));
                 }
