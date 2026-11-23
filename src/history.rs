@@ -281,18 +281,7 @@ pub fn write_zsh_file(path: &str, entries: &[String], append: bool) -> std::io::
         if e.starts_with(':') {
             text.push('\\');
         }
-        let mut end_backslashes = false;
-        for c in e.chars() {
-            if c == '\n' {
-                text.push('\\');
-            }
-            end_backslashes = c == '\\' || (end_backslashes && c == ' ');
-            text.push(c);
-        }
-        if end_backslashes {
-            text.push(' ');
-        }
-        text.push('\n');
+        push_entry(&mut text, e);
     }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -301,6 +290,140 @@ pub fn write_zsh_file(path: &str, entries: &[String], append: bool) -> std::io::
         .truncate(!append)
         .open(path)?;
     f.write_all(text.as_bytes())
+}
+
+// One entry and its newline, escaped as savehistfile does.
+fn push_entry(text: &mut String, e: &str) {
+    let mut end_backslashes = false;
+    for c in e.chars() {
+        if c == '\n' {
+            text.push('\\');
+        }
+        end_backslashes = c == '\\' || (end_backslashes && c == ' ');
+        text.push(c);
+    }
+    if end_backslashes {
+        text.push(' ');
+    }
+    text.push('\n');
+}
+
+/// A line of zsh's EXTENDED_HISTORY format: `: start:elapsed;command`,
+/// both times in seconds.
+pub fn extended_line(start: u64, elapsed: u64, entry: &str) -> String {
+    let mut text = format!(": {}:{};", start, elapsed);
+    push_entry(&mut text, entry);
+    text
+}
+
+/// An entry appended to meowsh's history file whose command is still
+/// running: where its line is, so the elapsed time can be filled in.
+pub struct Appended {
+    path: String,
+    offset: u64,
+    len: u64,
+    start: u64,
+    entry: String,
+}
+
+// The history file, locked against other shells until it is dropped.
+fn open_locked(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: the descriptor is open; the lock goes with it when it closes.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+/// Appends `entry` to meowsh's history file with the time it started and
+/// an elapsed time of 0, so the line is on disk before the command runs.
+pub fn append_timed(path: &str, entry: &str, start: u64) -> std::io::Result<Appended> {
+    use std::io::{Seek, SeekFrom, Write};
+    let line = extended_line(start, 0, entry);
+    let mut f = open_locked(path)?;
+    let offset = f.seek(SeekFrom::End(0))?;
+    f.write_all(line.as_bytes())?;
+    Ok(Appended {
+        path: path.to_string(),
+        offset,
+        len: line.len() as u64,
+        start,
+        entry: entry.to_string(),
+    })
+}
+
+/// Fills in how long the command took. Only when its line is still the
+/// last one: another shell may have appended since, and that is left
+/// alone.
+pub fn finish_timed(a: &Appended, elapsed: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    if elapsed == 0 {
+        return Ok(());
+    }
+    let mut f = open_locked(&a.path)?;
+    if f.metadata()?.len() != a.offset + a.len {
+        return Ok(());
+    }
+    f.set_len(a.offset)?;
+    f.seek(SeekFrom::Start(a.offset))?;
+    f.write_all(extended_line(a.start, elapsed, &a.entry).as_bytes())
+}
+
+// rustyline's history format, which meowsh used before: a "#V2" line, then
+// one entry per line with backslashes and newlines escaped.
+fn read_rustyline_text(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| *l != "#V2")
+        .map(|l| {
+            let mut out = String::new();
+            let mut it = l.chars();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    match it.next() {
+                        Some('n') => out.push('\n'),
+                        Some(o) => out.push(o),
+                        None => out.push('\\'),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// Reads meowsh's history file. One still in the old rustyline format is
+/// first rewritten in zsh's (its entries have no times), and the old file
+/// kept beside it as `<path>.rustyline`.
+pub fn read_own_file(path: &str) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let old = std::fs::read(path)
+        .ok()
+        .filter(|d| d.starts_with(b"#V2\n"))
+        .map(|d| read_rustyline_text(&String::from_utf8_lossy(&d)));
+    if let Some(entries) = old {
+        let tmp = format!("{}.new", path);
+        let converted = write_zsh_file(&tmp, &entries, false)
+            .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)))
+            .and_then(|_| std::fs::rename(path, format!("{}.rustyline", path)))
+            .and_then(|_| std::fs::rename(&tmp, path));
+        if converted.is_err() {
+            // Left as it was; nothing is appended in the other format.
+            let _ = std::fs::remove_file(&tmp);
+            return entries;
+        }
+    }
+    read_zsh_file(path).unwrap_or_default()
 }
 
 /// Reads a zsh history file (readhistline): backslash-newline continues
@@ -343,6 +466,50 @@ pub fn read_zsh_file(path: &str) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_history_file_records_start_and_elapsed_times() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("h").to_string_lossy().to_string();
+        let a = append_timed(&path, "sleep 3", 100).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ": 100:0;sleep 3\n");
+        finish_timed(&a, 3).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ": 100:3;sleep 3\n");
+        // Another shell's line after it: the earlier one is left alone.
+        let b = append_timed(&path, "print 'a\nb'", 104).unwrap();
+        append_timed(&path, ": other; x\\", 105).unwrap();
+        finish_timed(&b, 9).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            ": 100:3;sleep 3\n: 104:0;print 'a\\\nb'\n: 105:0;: other; x\\ \n"
+        );
+        assert_eq!(
+            read_own_file(&path),
+            ["sleep 3", "print 'a\nb'", ": other; x\\"]
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn old_rustyline_history_file_is_converted_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("h").to_string_lossy().to_string();
+        let old = "#V2\nls -l\nprint 'a\\nb' \\\\x\n: colon\n";
+        std::fs::write(&path, old).unwrap();
+        let want = ["ls -l", "print 'a\nb' \\x", ": colon"];
+        assert_eq!(read_own_file(&path), want);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ls -l\nprint 'a\\\nb' \\x\n\\: colon\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.rustyline", path)).unwrap(),
+            old
+        );
+        assert_eq!(read_own_file(&path), want);
+    }
 
     #[test]
     fn events_and_words() {

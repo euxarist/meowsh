@@ -194,8 +194,11 @@ back the word as typed, and typing anything else carries on from the
 selection. A grid taller than the terminal scrolls with the selection.
 
 History is kept in
-`~/.meowsh_history`; `$HISTFILE` is not used for it, so zsh's history file is
-never rewritten in a different format. Only an explicit `fc -W` or `fc -A`
+`~/.meowsh_history`, in zsh's `EXTENDED_HISTORY` format: each line is
+`: <start>:<elapsed>;<command>`, with the time the command started and how
+many seconds it ran. A file from an older meowsh (rustyline's format) is
+converted on first use and kept as `~/.meowsh_history.rustyline`. `$HISTFILE`
+is not used for it, so zsh's own history file is never touched. Only an explicit `fc -W` or `fc -A`
 without a file name writes `$HISTFILE`, in zsh's own format. With `-f` (no
 startup files) no history file is read or written, as in zsh.
 

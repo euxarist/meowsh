@@ -922,6 +922,15 @@ fn input_typed_ahead_of_a_command_goes_to_that_command() {
 }
 
 #[test]
+fn history_file_lines_carry_their_start_time() {
+    let out = on_terminal(
+        "PROMPT='> '\n",
+        "print one\rprint -r -- \"n=$(grep -c '^: [0-9]*:0;print one$' ~/.meowsh_history) [ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("n=1 [right]"), "output: {:?}", out);
+}
+
+#[test]
 fn no_history_file_without_startup_files() {
     let count = "print one\rprint -r -- \"own=$(ls -a ~ | grep -c meowsh_history) [ri\"\"ght]\"\r";
     // -f: nothing is saved, as in zsh.

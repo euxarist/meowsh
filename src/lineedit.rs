@@ -900,10 +900,14 @@ pub fn run_interactive() -> i32 {
     }
 
     let history_file = crate::shell::with_shell(|s| s.history_file.clone());
-    if !history_file.is_empty() {
-        let _ = rl.load_history(&history_file);
+    let entries = if history_file.is_empty() {
+        Vec::new()
+    } else {
+        crate::history::read_own_file(&history_file)
+    };
+    for e in &entries {
+        let _ = rl.add_history_entry(e.as_str());
     }
-    let entries: Vec<String> = rl.history().iter().cloned().collect();
     crate::shell::with_shell(|s| *s.history.lock().unwrap_or_else(|e| e.into_inner()) = entries);
 
     let rl = RefCell::new(rl);
@@ -916,6 +920,7 @@ pub fn run_interactive() -> i32 {
             };
             set_right_prompt(&prompt, cont);
             crate::menu::reset();
+            finish_history_entry();
             let line = rl.borrow_mut().readline(&prompt);
             match line {
                 Ok(line) => InputLine::Line(visible_line(&line).into_owned() + "\n"),
@@ -935,55 +940,35 @@ pub fn run_interactive() -> i32 {
             let clean = clean.trim_start().to_string();
             let mut rl = rl.borrow_mut();
             let _ = rl.add_history_entry(clean.as_str());
-            if !history_file.is_empty() {
-                let _ = rl.append_history(&history_file);
-            }
+            save_history_entry(&history_file, &clean);
         },
     );
     status
 }
 
-// rustyline's history file format: a "#V2" line, then one entry per line
-// with backslashes and newlines escaped.
-fn read_history_file(path: &str) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|l| *l != "#V2")
-        .map(|l| {
-            let mut out = String::new();
-            let mut it = l.chars();
-            while let Some(c) = it.next() {
-                if c == '\\' {
-                    match it.next() {
-                        Some('n') => out.push('\n'),
-                        Some(o) => out.push(o),
-                        None => out.push('\\'),
-                    }
-                } else {
-                    out.push(c);
-                }
-            }
-            out
-        })
-        .collect()
+thread_local! {
+    // The history line of the command running now, and when it started.
+    static RUNNING: RefCell<Option<(crate::history::Appended, std::time::Instant)>> =
+        const { RefCell::new(None) };
 }
 
-fn append_history_file(path: &str, line: &str) {
-    use std::io::Write;
-    let new = !std::path::Path::new(path).exists();
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let esc = line.replace('\\', "\\\\").replace('\n', "\\n");
-        let _ = if new {
-            writeln!(f, "#V2\n{}", esc)
-        } else {
-            writeln!(f, "{}", esc)
-        };
+// Appends an accepted line to the history file with the time it starts.
+fn save_history_entry(path: &str, line: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Ok(a) = crate::history::append_timed(path, line, start) {
+        RUNNING.with(|r| *r.borrow_mut() = Some((a, std::time::Instant::now())));
+    }
+}
+
+// Back at the prompt: the last command's line gets its elapsed time.
+fn finish_history_entry() {
+    if let Some((a, began)) = RUNNING.with(|r| r.borrow_mut().take()) {
+        let _ = crate::history::finish_timed(&a, began.elapsed().as_secs());
     }
 }
 
@@ -998,7 +983,7 @@ fn run_zle() -> i32 {
     crate::zle::refresh::set_tty_fd(tty);
     let history_file = crate::shell::with_shell(|s| s.history_file.clone());
     if !history_file.is_empty() {
-        let entries = read_history_file(&history_file);
+        let entries = crate::history::read_own_file(&history_file);
         crate::shell::with_shell(|s| {
             *s.history.lock().unwrap_or_else(|e| e.into_inner()) = entries
         });
@@ -1007,6 +992,7 @@ fn run_zle() -> i32 {
     let mut pending = String::new();
     let status = crate::exec::run_input(
         |cont| {
+            finish_history_entry();
             let prompt = if cont {
                 continuation_prompt()
             } else {
@@ -1061,9 +1047,7 @@ fn run_zle() -> i32 {
             if !crate::exec::history_add(text) {
                 return;
             }
-            if !history_file.is_empty() {
-                append_history_file(&history_file, text.trim_start());
-            }
+            save_history_entry(&history_file, text.trim_start());
         },
     );
     status
