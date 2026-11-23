@@ -1954,7 +1954,7 @@ pub fn addmatches(z: &mut Zle, dat: &mut Cadata, argv: &[String]) -> i32 {
                 bpadd = clen(&s) as i32 - ml;
             } else {
                 if llpl <= lpl && strpfx(&lpre, &s) {
-                    lpre = String::new();
+                    lpre.clear();
                 } else if llpl > lpl && strpfx(&s, &lpre) {
                     lpre = lpre.chars().skip(lpl).collect();
                 } else {
@@ -1980,7 +1980,7 @@ pub fn addmatches(z: &mut Zle, dat: &mut Cadata, argv: &[String]) -> i32 {
                 bsadd = clen(&s) as i32 - ml;
             } else {
                 if llsl <= lsl && strsfx(&lsuf, &s) {
-                    lsuf = String::new();
+                    lsuf.clear();
                 } else if llsl > lsl && strsfx(&s, &lsuf) {
                     lsuf = csub(&lsuf, 0, llsl - lsl);
                 } else {
