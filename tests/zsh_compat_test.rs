@@ -2145,6 +2145,28 @@ fi
 }
 
 #[test]
+fn gdbm_store_in_forked_child_reaches_parent_compat() {
+    if !meowsh::zgdbm::is_available() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("t.gdbm");
+    let (st, out, err) = sh(&format!(
+        r#"
+zmodload zsh/db/gdbm
+ztie -d db/gdbm -f {db} dbase
+fun() {{ while read line; do echo $line; done }}
+eval "dbase[testkey]=value1" | fun
+echo $dbase[testkey]
+zuntie -u dbase
+"#,
+        db = db.display()
+    ));
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "value1\n");
+}
+
+#[test]
 fn ostype_exepath_and_options_assoc_sync_compat() {
     let (st, out, err) = sh(r#"
 print "os=$OSTYPE"
