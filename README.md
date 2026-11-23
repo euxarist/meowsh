@@ -196,7 +196,8 @@ selection. A grid taller than the terminal scrolls with the selection.
 History is kept in
 `~/.meowsh_history`; `$HISTFILE` is not used for it, so zsh's history file is
 never rewritten in a different format. Only an explicit `fc -W` or `fc -A`
-without a file name writes `$HISTFILE`, in zsh's own format.
+without a file name writes `$HISTFILE`, in zsh's own format. With `-f` (no
+startup files) no history file is read or written, as in zsh.
 
 ## Using meowsh as your shell
 

@@ -1398,6 +1398,14 @@ impl TempVars {
     fn set_as(assigns: &[Expanded], export: bool) -> Result<TempVars, i32> {
         let mut saved = TempVars(Vec::new());
         for a in assigns {
+            // The error ends a script, as zsh's does.
+            let fail = |saved: TempVars, st: i32| {
+                saved.restore();
+                if !interactive() && !crate::options::is_set("continueonerror") {
+                    set_error_exit(st);
+                }
+                Err(st)
+            };
             // `HELLO[2,4]=oo cmd`: the element changes for the command
             // too, and so does an array.
             let v = match &a.value {
@@ -1406,20 +1414,14 @@ impl TempVars {
                     let prev = with_shell(|s| s.param(&a.name).cloned());
                     saved.0.push((a.name.clone(), prev));
                     if let Err(st) = apply_assign(a, export) {
-                        saved.restore();
-                        return Err(st);
+                        return fail(saved, st);
                     }
                     continue;
                 }
             };
             if is_readonly(&a.name) {
                 shell_err(&crate::shell::readonly_message(&a.name));
-                saved.restore();
-                // The error ends a script, as zsh's does.
-                if !interactive() && !crate::options::is_set("continueonerror") {
-                    set_error_exit(1);
-                }
-                return Err(1);
+                return fail(saved, 1);
             }
             let prev = with_shell(|s| s.param(&a.name).cloned());
             saved.0.push((a.name.clone(), prev));
@@ -1433,6 +1435,20 @@ impl TempVars {
 
     fn restore(self) {
         for (name, prev) in self.0.into_iter().rev() {
+            // The command made the name local to this function (`x=1 eval
+            // 'typeset x'`). As in zsh the old value replaces that local;
+            // the temporary one hidden under it must not come back when
+            // the function returns.
+            with_shell(|s| {
+                let depth = s.local_scopes.len();
+                let local_now = s.params.get(&name).is_some_and(|p| p.level == depth);
+                let was_outer = prev.as_ref().is_none_or(|p| p.level < depth);
+                if local_now && was_outer {
+                    if let Some(scope) = s.local_scopes.last_mut() {
+                        scope.remove(&name);
+                    }
+                }
+            });
             match prev {
                 Some(p) => {
                     with_shell(|s| {

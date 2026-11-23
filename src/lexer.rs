@@ -871,7 +871,12 @@ impl Lexer {
             while j < self.chars.len() && self.chars[j].is_ascii_digit() {
                 j += 1;
             }
-            if j < self.chars.len() && matches!(self.chars[j], '<' | '>') {
+            // `2<->`: the digits belong to a numeric range pattern, not to
+            // a redirection.
+            if j < self.chars.len()
+                && matches!(self.chars[j], '<' | '>')
+                && numeric_range_len(&self.chars, j).is_none()
+            {
                 let digits: String = self.chars[self.pos..j].iter().collect();
                 if let Ok(n) = digits.parse::<i32>() {
                     self.pos = j;

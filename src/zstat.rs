@@ -26,13 +26,35 @@ fn match_field(arg: &str) -> Result<usize, String> {
     }
 }
 
-fn format_mode(mode: libc::mode_t, octal: bool, raw: bool, sym: bool) -> String {
-    if raw || !sym {
-        if octal {
-            return format!("{:06o}", mode);
-        }
-        return mode.to_string();
+// zsh's raw and string forms of one element: either alone, or with both
+// asked for (-r) the string in parentheses after the raw number.
+fn raw_and_string(f: &StatFmt<'_>, raw: String, string: impl FnOnce() -> String) -> String {
+    match (f.raw, f.sym) {
+        (true, true) => format!("{} ({})", raw, string()),
+        (false, true) => string(),
+        _ => raw,
     }
+}
+
+// The user or group name, or the number when it has none.
+fn id_name(id: u32, group: bool) -> String {
+    // SAFETY: the returned record is read before any other lookup.
+    let name = unsafe {
+        if group {
+            let g = libc::getgrgid(id);
+            (!g.is_null()).then(|| std::ffi::CStr::from_ptr((*g).gr_name).to_bytes().to_vec())
+        } else {
+            let p = libc::getpwuid(id);
+            (!p.is_null()).then(|| std::ffi::CStr::from_ptr((*p).pw_name).to_bytes().to_vec())
+        }
+    };
+    match name {
+        Some(n) => bytes_to_zstr(&n),
+        None => id.to_string(),
+    }
+}
+
+fn format_mode(mode: libc::mode_t) -> String {
     let kind = match mode & libc::S_IFMT {
         libc::S_IFDIR => 'd',
         libc::S_IFLNK => 'l',
@@ -80,10 +102,7 @@ fn format_mode(mode: libc::mode_t, octal: bool, raw: bool, sym: bool) -> String 
     s
 }
 
-fn format_time(sec: i64, raw: bool, sym: bool, gmt: bool, fmt: &str) -> String {
-    if raw || !sym {
-        return sec.to_string();
-    }
+fn format_time(sec: i64, gmt: bool, fmt: &str) -> String {
     let t = sec;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe {
@@ -126,15 +145,28 @@ fn field_value(idx: usize, st: &libc::stat, link_target: &str, f: &StatFmt<'_>) 
     match idx {
         0 => st.st_dev.to_string(),
         1 => st.st_ino.to_string(),
-        2 => format_mode(st.st_mode, f.octal, f.raw, f.sym),
+        2 => {
+            let raw = if f.octal {
+                format!("0{:o}", st.st_mode)
+            } else {
+                st.st_mode.to_string()
+            };
+            raw_and_string(f, raw, || format_mode(st.st_mode))
+        }
         3 => st.st_nlink.to_string(),
-        4 => st.st_uid.to_string(),
-        5 => st.st_gid.to_string(),
+        4 => raw_and_string(f, st.st_uid.to_string(), || id_name(st.st_uid, false)),
+        5 => raw_and_string(f, st.st_gid.to_string(), || id_name(st.st_gid, true)),
         6 => st.st_rdev.to_string(),
         7 => st.st_size.to_string(),
-        8 => format_time(st.st_atime, f.raw, f.sym, f.gmt, f.fmt),
-        9 => format_time(st.st_mtime, f.raw, f.sym, f.gmt, f.fmt),
-        10 => format_time(st.st_ctime, f.raw, f.sym, f.gmt, f.fmt),
+        8 => raw_and_string(f, st.st_atime.to_string(), || {
+            format_time(st.st_atime, f.gmt, f.fmt)
+        }),
+        9 => raw_and_string(f, st.st_mtime.to_string(), || {
+            format_time(st.st_mtime, f.gmt, f.fmt)
+        }),
+        10 => raw_and_string(f, st.st_ctime.to_string(), || {
+            format_time(st.st_ctime, f.gmt, f.fmt)
+        }),
         11 => st.st_blksize.to_string(),
         12 => st.st_blocks.to_string(),
         13 => link_target.to_string(),
@@ -236,7 +268,9 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
                 },
                 'F' => match take(&mut i, &mut chars) {
                     Some(f) => {
+                        // A time format is only of use in the string form.
                         timefmt = f;
+                        sym = true;
                         break;
                     }
                     None => {
@@ -263,12 +297,17 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
         return 1;
     }
 
+    // zsh: -g implies -s; -r shows both forms; the raw form is the
+    // default.
+    let sym_only = sym || gmt;
+    let (raw, sym) = (raw || !sym_only, sym_only || raw);
+    let mut status = 0;
     let mut collected: Vec<String> = Vec::new();
     let mut hash_map: BTreeMap<String, String> = BTreeMap::new();
     let multi = targets.len() > 1;
     let print_stdout = arr_name.is_none() && hash_name.is_none();
 
-    for target in &targets {
+    for (n, target) in targets.iter().enumerate() {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let mut link_target = String::new();
         let rc = if let Some(fd) = use_fd {
@@ -299,9 +338,21 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
             }
         };
         if rc != 0 {
+            // zsh's wording: the system message, lowercased.
             let e = std::io::Error::last_os_error();
-            builtin_err(cmd, &format!("{}: {}", target, e));
-            return 1;
+            let msg = crate::exec::strerror(e.raw_os_error().unwrap_or(0));
+            let mut c = msg.chars();
+            let msg = match c.next() {
+                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                None => msg,
+            };
+            builtin_err(cmd, &format!("{}: {}", target, msg));
+            // Printing goes on to the next file; an array is not set.
+            if use_fd.is_some() || arr_name.is_some() {
+                return 1;
+            }
+            status = 1;
+            continue;
         }
         let range = match pick {
             Some(idx) => idx..=idx,
@@ -348,6 +399,10 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
                 }
             }
         }
+        // A blank line parts one file's listing from the next.
+        if print_stdout && pick.is_none() && n + 1 < targets.len() {
+            out("\n");
+        }
     }
 
     if let Some(arr) = arr_name {
@@ -374,5 +429,5 @@ pub fn builtin_zstat(words: &[String]) -> i32 {
     } else {
         let _ = var_set("REPLY", "", false);
     }
-    0
+    status
 }

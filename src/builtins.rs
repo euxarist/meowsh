@@ -568,11 +568,8 @@ fn builtin_break(words: &[String], is_break: bool) -> i32 {
                 "not in for, while, until, select, or repeat loop"
             },
         );
-        // In a subshell of a loop this is fatal: the subshell ends there.
-        if outer > 0 {
-            return crate::exec::abort_command(1);
-        }
-        return 1;
+        // zsh: a fatal error.
+        return crate::exec::abort_command(1);
     }
     let n = n.min(depth);
     set_flow(if is_break {

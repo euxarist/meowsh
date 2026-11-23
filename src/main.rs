@@ -238,6 +238,10 @@ fn main() {
 
     if options::is_set("rcs") {
         source_startup_files(args.login, interactive);
+    } else {
+        // -f: zsh keeps no history file without its startup files, and
+        // neither does meowsh.
+        with_shell(|s| s.history_file.clear());
     }
 
     let status = if let Some(cmd) = &args.command {

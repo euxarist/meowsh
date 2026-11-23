@@ -699,6 +699,51 @@ fn assignments_before_special_builtins_are_temporary() {
 }
 
 #[test]
+fn prefix_assignment_errors_and_scopes_compat() {
+    // A read-only array ends the script like a read-only scalar.
+    let (st, out, _) = sh("readonly r=1; r=(1 2) :; print after");
+    assert_eq!((st, out.as_str()), (1, ""));
+    // A local declared by the command does not bring the temporary value
+    // back when the function returns.
+    let (_, out, err) = sh(
+        "x=0; f() { x=1 eval 'typeset x=7; print $x'; print $x }; f; print $x; \
+         unset y; g() { y=1 eval 'typeset y=7' }; g; print ${+y}",
+    );
+    assert_eq!(out, "7\n0\n0\n0\n", "stderr: {}", err);
+}
+
+#[test]
+fn digits_before_a_numeric_range_are_not_a_redirection() {
+    let dir = TempDir::new().unwrap();
+    for f in ["21", "25", "x7"] {
+        std::fs::write(dir.path().join(f), "").unwrap();
+    }
+    let (_, out, err) = sh(&format!(
+        "cd {}; [[ 2026 = 2<-> ]] && print year; case 215 in 2<->5) print m;; esac; \
+         print 2<->; print 2<4-9>; print hi 2>/dev/null",
+        dir.path().display()
+    ));
+    assert_eq!(out, "year\nm\n21 25\n25\nhi\n", "stderr: {}", err);
+}
+
+#[test]
+fn break_and_continue_outside_a_loop_are_fatal() {
+    for cmd in [
+        "break",
+        "continue",
+        "f() { break }; f",
+        "if break; then :; fi",
+    ] {
+        let (st, out, err) = sh(&format!("{}; print after", cmd));
+        assert_eq!((st, out.as_str()), (1, ""), "{}: {}", cmd, err);
+        assert!(err.contains("not in"), "{}: {}", cmd, err);
+    }
+    // The error ends an eval, not the script.
+    let (_, out, _) = sh("eval break; print after");
+    assert_eq!(out, "after\n");
+}
+
+#[test]
 fn not_found_handler_math_functions_and_argv() {
     let (_, out, err) = sh(
         "command_not_found_handler() { print handled $1 ${argv[2,-1]}; return 3 }; \
@@ -754,6 +799,10 @@ fn output_files_equals_and_glob_exclusions() {
 // Runs an interactive meowsh on a 60-column pseudo-terminal, types
 // `input`, and returns everything it drew.
 fn on_terminal(zshrc: &str, input: &str) -> String {
+    on_terminal_with(&[], zshrc, input)
+}
+
+fn on_terminal_with(args: &[&str], zshrc: &str, input: &str) -> String {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     let home = TempDir::new().unwrap();
@@ -779,6 +828,7 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .env("HOME", home.path())
         .env("TERM", "xterm")
+        .args(args)
         .arg("-i")
         .stdin(tty(slave))
         .stdout(tty(slave))
@@ -869,6 +919,18 @@ fn input_typed_ahead_of_a_command_goes_to_that_command() {
     );
     assert!(out.contains("v=typed [right]"), "output: {:?}", out);
     assert!(!out.contains("command not found"), "output: {:?}", out);
+}
+
+#[test]
+fn no_history_file_without_startup_files() {
+    let count = "print one\rprint -r -- \"own=$(ls -a ~ | grep -c meowsh_history) [ri\"\"ght]\"\r";
+    // -f: nothing is saved, as in zsh.
+    let out = on_terminal_with(&["-f"], "", count);
+    assert!(out.contains("own=0 [right]"), "output: {:?}", out);
+    // Otherwise the history goes to meowsh's own file, whatever HISTFILE
+    // says.
+    let out = on_terminal("HISTFILE=~/h\nPROMPT='> '\n", count);
+    assert!(out.contains("own=1 [right]"), "output: {:?}", out);
 }
 
 #[test]
@@ -1930,6 +1992,24 @@ fn zstat_type_name_flags_compat() {
     assert_eq!(
         out,
         "bare\nnlink N\n/ N\n/ N\nN\n/:\ndevice  N\nnlink\nnum\n"
+    );
+}
+
+#[test]
+fn zstat_raw_and_string_forms_compat() {
+    let (st, out, err) = sh("zmodload -F zsh/stat b:zstat; \
+         zstat -r +mode /; zstat -s +mode /; zstat -or +mode /; zstat -o +mode /; \
+         zstat -s +uid /; zstat -r +uid /; \
+         [[ $(zstat -F %Y +mtime /) = <2000-9999> ]] && print year; \
+         [[ $(zstat -rF %Y +mtime /) = <->' ('<2000-9999>')' ]] && print both; \
+         [[ $(zstat -g +mtime /) = *' '* ]] && print gmt; \
+         zstat / /dev/null | grep -c '^$'; \
+         zstat +nlink /nonexistent / 2>/dev/null | sed 's/[0-9]*$/N/'; print $pipestatus[1]");
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(
+        out,
+        "16877 (drwxr-xr-x)\ndrwxr-xr-x\n040755 (drwxr-xr-x)\n040755\nroot\n0 (root)\n\
+         year\nboth\ngmt\n1\n/ N\n1\n"
     );
 }
 
