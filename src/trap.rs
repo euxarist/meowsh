@@ -91,7 +91,7 @@ fn set_handler(sig: i32, handler: libc::sighandler_t) {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler;
-        sa.sa_flags = libc::SA_RESTART;
+        sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(sig, &sa, std::ptr::null_mut());
     }
@@ -200,6 +200,7 @@ pub fn reset_in_child(background_without_job_control: bool) {
         set_handler(libc::SIGQUIT, libc::SIG_IGN);
     }
     PENDING.store(0, Ordering::SeqCst);
+    IN_TRAP.store(false, Ordering::SeqCst);
 }
 
 /// True while a trap action runs.

@@ -695,6 +695,19 @@ fn multio_worker(sources: &[i32], sinks: &[i32], keep: &[i32]) -> i32 {
     unsafe { libc::_exit(0) }
 }
 
+fn move_fd(src: i32, dst: i32) -> bool {
+    if src == dst {
+        unsafe {
+            libc::fcntl(dst, libc::F_SETFD, 0);
+        }
+        true
+    } else {
+        let ok = unsafe { libc::dup2(src, dst) } >= 0;
+        close(src);
+        ok
+    }
+}
+
 /// Applies redirections. With `save`, the previous descriptors are kept
 /// so `restore_redirs` can undo them. With MULTIOS, several output (or
 /// input) redirections of one descriptor all take effect, through a
@@ -708,6 +721,9 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
     for r in &expanded {
         if let Some(var) = &r.var {
             if let Err(e) = redir_to_var(r, var) {
+                for (_, _, t) in &multi {
+                    t.iter().for_each(|&f| close(f));
+                }
                 restore_redirs(saved);
                 return Err(e);
             }
@@ -798,9 +814,22 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
                 if save {
                     saved.push((2, dup_high(2)));
                 }
-                let ok = unsafe { libc::dup2(newfd, fd) >= 0 && libc::dup2(newfd, 2) >= 0 };
-                close(newfd);
-                ok
+                let ok1 = if newfd == fd {
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+                    true
+                } else {
+                    unsafe { libc::dup2(newfd, fd) >= 0 }
+                };
+                let ok2 = if newfd == 2 {
+                    unsafe { libc::fcntl(2, libc::F_SETFD, 0) };
+                    true
+                } else {
+                    unsafe { libc::dup2(newfd, 2) >= 0 }
+                };
+                if newfd != fd && newfd != 2 {
+                    close(newfd);
+                }
+                ok1 && ok2
             }
             Target::Dup(src) => src == fd || unsafe { libc::dup2(src, fd) } >= 0,
             Target::Close => {
@@ -813,6 +842,9 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
         };
         if !ok {
             err_line(&format!("meowsh: {}: {}", fd, strerror(last_errno())));
+            for (_, _, t) in &multi {
+                t.iter().for_each(|&f| close(f));
+            }
             restore_redirs(saved);
             return Err(RedirError);
         }
@@ -843,7 +875,7 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             if save {
                 saved.push((-2, pid));
             } else if let Ok(mut p) = MULTIO_PIDS.lock() {
-                p.push(pid);
+                p.push((pid, fd));
             }
         }
     }
@@ -865,7 +897,7 @@ fn own_redirs(cmd: &Node) -> bool {
 
 // Copying processes started without saved descriptors (in a child about
 // to run a command); it waits for them before exiting.
-static MULTIO_PIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+static MULTIO_PIDS: std::sync::Mutex<Vec<(i32, i32)>> = std::sync::Mutex::new(Vec::new());
 
 // Runs the command in place, or, when MULTIOS copiers serve it, as a
 // child, so the copiers can be waited for before exiting.
@@ -875,6 +907,23 @@ fn exec_with_multios(words: &[String], argv0: Option<&str>, env: &[(String, Stri
         exec_external_as(words, argv0, env);
     }
     let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        for fd in 0..10 {
+            close(fd);
+        }
+        for (_, fd) in &workers {
+            if *fd >= 10 {
+                close(*fd);
+            }
+        }
+        for (w, _) in workers {
+            let mut ws = 0;
+            unsafe {
+                libc::waitpid(w, &mut ws, 0);
+            }
+        }
+        unsafe { libc::_exit(1) }
+    }
     if pid == 0 {
         exec_external_as(words, argv0, env);
     }
@@ -884,8 +933,13 @@ fn exec_with_multios(words: &[String], argv0: Option<&str>, env: &[(String, Stri
         for fd in 0..10 {
             libc::close(fd);
         }
+        for (_, fd) in &workers {
+            if *fd >= 10 {
+                libc::close(*fd);
+            }
+        }
     }
-    for w in workers {
+    for (w, _) in workers {
         let mut ws = 0;
         unsafe {
             libc::waitpid(w, &mut ws, 0);
@@ -899,7 +953,7 @@ fn exec_with_multios(words: &[String], argv0: Option<&str>, env: &[(String, Stri
     unsafe { libc::_exit(code) }
 }
 
-fn take_multio_pids() -> Vec<i32> {
+fn take_multio_pids() -> Vec<(i32, i32)> {
     MULTIO_PIDS
         .lock()
         .map(|mut p| std::mem::take(&mut *p))
@@ -3098,17 +3152,18 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
     for (k, cmd) in cmds.iter().enumerate() {
         let last = k + 1 == cmds.len();
         if last && in_shell {
-            let saved = unsafe { libc::dup(0) };
-            unsafe {
-                libc::dup2(prev_read, 0);
-            }
-            close(prev_read);
+            let saved = dup_high(0);
+            move_fd(prev_read, 0);
             PIPE_IN.store(own_redirs(cmd), std::sync::atomic::Ordering::SeqCst);
             let st = exec_node(cmd);
             PIPE_IN.store(false, std::sync::atomic::Ordering::SeqCst);
-            unsafe {
-                libc::dup2(saved, 0);
-                libc::close(saved);
+            if saved >= 0 {
+                unsafe {
+                    libc::dup2(saved, 0);
+                    libc::close(saved);
+                }
+            } else {
+                close(0);
             }
             let mut codes = if pids.is_empty() {
                 Vec::new()
@@ -3145,16 +3200,22 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
                 w >= 0 && own_redirs(cmd),
                 std::sync::atomic::Ordering::SeqCst,
             );
-            unsafe {
-                if prev_read >= 0 {
-                    libc::dup2(prev_read, 0);
-                    libc::close(prev_read);
+            let mut p_out = w;
+            if r >= 0 {
+                close(r);
+            }
+            if prev_read >= 0 && p_out == 0 {
+                let hi = dup_high(p_out);
+                if hi >= 0 {
+                    close(p_out);
+                    p_out = hi;
                 }
-                if w >= 0 {
-                    libc::dup2(w, 1);
-                    libc::close(w);
-                    libc::close(r);
-                }
+            }
+            if prev_read >= 0 {
+                move_fd(prev_read, 0);
+            }
+            if p_out >= 0 {
+                move_fd(p_out, 1);
             }
             exec_in_child(cmd);
         }
@@ -3410,10 +3471,7 @@ fn exec_background(node: &Node) -> i32 {
     if pid == 0 {
         if !jc {
             if let Ok(fd) = open_file("/dev/null", libc::O_RDONLY) {
-                unsafe {
-                    libc::dup2(fd, 0);
-                }
-                close(fd);
+                move_fd(fd, 0);
             }
         }
         exec_in_child(node);
@@ -3601,7 +3659,13 @@ fn exec_select(var: &str, words: Option<&[String]>, body: &Node) -> i32 {
 // coproc cmd: runs cmd in the background connected to two pipes, which
 // `print -p`, `read -p` and the `>&p`/`<&p` redirections use.
 fn exec_coproc(body: &Node) -> i32 {
-    let (Ok((in_r, in_w)), Ok((out_r, out_w))) = (pipe_cloexec(), pipe_cloexec()) else {
+    let Ok((in_r, in_w)) = pipe_cloexec() else {
+        err_line("meowsh: coproc: cannot create pipes");
+        return 1;
+    };
+    let Ok((out_r, out_w)) = pipe_cloexec() else {
+        close(in_r);
+        close(in_w);
         err_line("meowsh: coproc: cannot create pipes");
         return 1;
     };
@@ -3611,13 +3675,18 @@ fn exec_coproc(body: &Node) -> i32 {
     }
     let pid = fork_process(ForkKind::Background);
     if pid == 0 {
-        unsafe {
-            libc::dup2(in_r, 0);
-            libc::dup2(out_w, 1);
+        close(in_w);
+        close(out_r);
+        let mut out_w = out_w;
+        if out_w == 0 {
+            let hi = dup_high(out_w);
+            if hi >= 0 {
+                close(out_w);
+                out_w = hi;
+            }
         }
-        for fd in [in_r, in_w, out_r, out_w] {
-            close(fd);
-        }
+        move_fd(in_r, 0);
+        move_fd(out_w, 1);
         exec_in_child(body);
     }
     close(in_r);
@@ -3831,9 +3900,33 @@ pub fn run_string(src: &str) -> i32 {
     run_string_named(src, None)
 }
 
+const MAX_EVAL_DEPTH: usize = 500;
+
+thread_local! {
+    static EVAL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct EvalDepthGuard;
+
+impl Drop for EvalDepthGuard {
+    fn drop(&mut self) {
+        EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Like `run_string`, with errors naming `ctx` (`(eval)`, a sourced
 /// file) and counting lines from the start of `src`.
 pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
+    let depth = EVAL_DEPTH.with(|d| d.get());
+    if depth >= MAX_EVAL_DEPTH {
+        err_line(&format!(
+            "meowsh: maximum nested evaluation depth reached: {}",
+            MAX_EVAL_DEPTH
+        ));
+        return 1;
+    }
+    EVAL_DEPTH.with(|d| d.set(depth + 1));
+    let _depth_guard = EvalDepthGuard;
     // NO_EVAL_LINENO: an eval keeps its caller's name and line.
     let frozen = ctx == Some("(eval)") && !crate::options::is_set("evallineno");
     let ctx = ctx.filter(|_| !frozen);
@@ -3875,6 +3968,16 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
 
 /// Runs pre-compiled AST nodes (e.g. from `.zwc`) in a named frame without re-parsing.
 pub fn run_nodes_named(nodes: &[Node], ctx: Option<&str>) -> i32 {
+    let depth = EVAL_DEPTH.with(|d| d.get());
+    if depth >= MAX_EVAL_DEPTH {
+        err_line(&format!(
+            "meowsh: maximum nested evaluation depth reached: {}",
+            MAX_EVAL_DEPTH
+        ));
+        return 1;
+    }
+    EVAL_DEPTH.with(|d| d.set(depth + 1));
+    let _depth_guard = EvalDepthGuard;
     let saved_line = match ctx {
         Some(c) => push_frame(c, 0, (c != "(eval)").then(|| format!("{}:0", c))),
         None => crate::shell::with_err_ctx(|e| e.lineno),
@@ -4055,11 +4158,10 @@ fn command_subst_in(src: &str) -> (String, i32) {
     };
     let pid = fork_process(ForkKind::Inline);
     if pid == 0 {
-        unsafe {
-            libc::close(r);
-            libc::dup2(w, 1);
-            libc::close(w);
+        if r != 1 {
+            close(r);
         }
+        move_fd(w, 1);
         EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
         let base = crate::shell::with_err_ctx(|e| e.lineno.saturating_sub(1));
         let prefixed = format!("{}{}", "\n".repeat(base), src);
@@ -4127,11 +4229,11 @@ fn process_subst_in(src: &str, read: bool) -> Option<String> {
     let (mine, theirs) = if read { (r, w) } else { (w, r) };
     let pid = fork_process(ForkKind::Inline);
     if pid == 0 {
-        unsafe {
-            libc::close(mine);
-            libc::dup2(theirs, if read { 1 } else { 0 });
-            libc::close(theirs);
+        let dst = if read { 1 } else { 0 };
+        if mine != dst {
+            close(mine);
         }
+        move_fd(theirs, dst);
         EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
         let base = crate::shell::with_err_ctx(|e| e.lineno.saturating_sub(1));
         let prefixed = format!("{}{}", "\n".repeat(base), src);

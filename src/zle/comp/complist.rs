@@ -2700,13 +2700,11 @@ fn domenuselect(z: &mut Zle, dat: Option<i32>) -> i32 {
         step = crate::arith::eval(&s).unwrap_or(0) as i32;
         match step.cmp(&0) {
             std::cmp::Ordering::Equal => step = (zlines - pl) >> 1,
-            std::cmp::Ordering::Less => {
-                step += zlines - pl;
-                if step < 0 {
-                    step = 1;
-                }
-            }
+            std::cmp::Ordering::Less => step += zlines - pl,
             std::cmp::Ordering::Greater => {}
+        }
+        if step <= 0 {
+            step = 1;
         }
     }
     let mut mode = 0;
@@ -2750,7 +2748,12 @@ fn domenuselect(z: &mut Zle, dat: Option<i32>) -> i32 {
     let mk = MSKEYMAP.with(|k| k.borrow().clone());
     z.selectlocalmap(mk);
     set(&NOSELECT, 1);
-    while let Some(mr) = cur_match(z) {
+    let skip_limit = z.comp.nmatches.max(1) as usize;
+    let saved_mult = z.zmod.mult;
+    for _ in 0..skip_limit {
+        let Some(mr) = cur_match(z) else {
+            break;
+        };
         let m = mr.borrow().clone();
         let skip = (z.comp.menuacc != 0 && {
             let (pre, post) = (z.comp.minfo.prebr.clone(), z.comp.minfo.postbr.clone());
@@ -2761,8 +2764,10 @@ fn domenuselect(z: &mut Zle, dat: Option<i32>) -> i32 {
         if !skip {
             break;
         }
+        z.zmod.mult = 1;
         do_menucmp(z, 0);
     }
+    z.zmod.mult = saved_mult;
 
     set(&MSELECT, cur_match(z).as_ref().map_or(-1, gnum_of));
     set(&MLINE, 0);

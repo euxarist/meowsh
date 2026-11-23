@@ -309,7 +309,10 @@ impl Enc {
 struct Dec<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: usize,
 }
+
+const MAX_ZWC_DEPTH: usize = 256;
 
 impl<'a> Dec<'a> {
     fn u8(&mut self) -> Option<u8> {
@@ -425,6 +428,15 @@ impl<'a> Dec<'a> {
         })
     }
     fn node(&mut self) -> Option<Node> {
+        if self.depth >= MAX_ZWC_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let res = self.node_inner();
+        self.depth -= 1;
+        res
+    }
+    fn node_inner(&mut self) -> Option<Node> {
         match self.u8()? {
             0 => {
                 let line = self.usize()?;
@@ -592,7 +604,11 @@ fn decode_program(bytes: &[u8]) -> Option<Vec<Node>> {
     if bytes.get(0..4) != Some(PAYLOAD_MAGIC.as_slice()) {
         return None;
     }
-    let mut dec = Dec { buf: bytes, pos: 4 };
+    let mut dec = Dec {
+        buf: bytes,
+        pos: 4,
+        depth: 0,
+    };
     let len = dec.usize()?;
     let mut nodes = Vec::with_capacity(len.min(256));
     for _ in 0..len {

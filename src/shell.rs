@@ -685,7 +685,7 @@ fn convert_for(attrs: u32, value: &str) -> Result<String, String> {
 }
 
 pub fn format_int(n: i64, base: u32) -> String {
-    if base == 0 || base == 10 {
+    if base == 0 || base == 10 || !(2..=36).contains(&base) {
         return n.to_string();
     }
     if crate::options::quick("cbases")

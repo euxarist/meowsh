@@ -188,7 +188,7 @@ pub fn sysparam(key: &str) -> Option<String> {
 
 /// The `systell()` math function: the current offset of `fd`.
 pub fn systell(fd: i64) -> Result<i64, String> {
-    if fd < 0 {
+    if fd < 0 || fd > libc::c_int::MAX as i64 {
         return Err("file descriptor out of range".to_string());
     }
     // SAFETY: lseek takes no pointers; a bad fd just fails with -1.

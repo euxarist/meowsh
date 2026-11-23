@@ -460,7 +460,7 @@ fn int_binop(op: &str, l: i64, r: i64) -> Result<i64, String> {
             for _ in 0..r.min(64) {
                 acc = acc.wrapping_mul(l);
             }
-            if r > 64 && l.abs() > 1 {
+            if r > 64 && l.unsigned_abs() > 1 {
                 acc = 0;
             }
             acc
