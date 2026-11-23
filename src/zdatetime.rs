@@ -34,7 +34,8 @@ pub fn epoch_param(name: &str) -> Option<Value> {
 
 /// Broken-down local time for `secs`, per the process's TZ.
 pub fn localtime(secs: i64) -> Option<libc::tm> {
-    let t = secs;
+    // The platform's time_t: 32 bits on some targets.
+    let t = secs as _;
     // SAFETY: tm is plain old data, so all-zero is a valid value.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers refer to live locals.

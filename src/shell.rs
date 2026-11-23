@@ -2557,7 +2557,8 @@ fn time_fmt(fmt: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let t = now.as_secs() as i64;
+    // The platform's time_t, which libc no longer lets 32-bit musl name.
+    let t = now.as_secs() as _;
     // SAFETY: localtime_r fills a zeroed tm from a valid time_t.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();

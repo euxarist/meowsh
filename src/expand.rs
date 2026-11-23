@@ -3021,13 +3021,10 @@ pub(crate) fn backslash_quote(s: &str) -> String {
         |c: char| (c as u32) < 32 || c == '\x7f' || crate::shell::decode_raw_byte(c).is_some();
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::new();
-    let mut in_dollar = false;
     for (k, &c) in chars.iter().enumerate() {
         if is_unprint(c) {
-            if !in_dollar {
-                out.push_str("$'");
-                in_dollar = true;
-            }
+            // zsh quotes each unprintable character on its own.
+            out.push_str("$'");
             if let Some(b) = crate::shell::decode_raw_byte(c) {
                 out.push_str(&format!("\\{:03o}", b));
             } else {
@@ -3049,19 +3046,13 @@ pub(crate) fn backslash_quote(s: &str) -> String {
                     other => out.push_str(&format!("\\{:03o}", other as u32)),
                 }
             }
-            continue;
-        }
-        if in_dollar {
             out.push('\'');
-            in_dollar = false;
+            continue;
         }
         if " '\\\"`$&|;<>()[]{}*?#^".contains(c) || (matches!(c, '~' | '=') && k == 0) {
             out.push('\\');
         }
         out.push(c);
-    }
-    if in_dollar {
-        out.push('\'');
     }
     out
 }

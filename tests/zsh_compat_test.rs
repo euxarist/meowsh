@@ -727,6 +727,18 @@ fn digits_before_a_numeric_range_are_not_a_redirection() {
 }
 
 #[test]
+fn q_flag_quotes_each_unprintable_character_on_its_own() {
+    let (_, out, err) = sh(
+        "x=$'a\\tb\\n\\nc'; print -r -- ${(q)x}; x=$'\\e[1m\\x01\\x7f'; print -r -- ${(q)x} ${(q+)x}",
+    );
+    assert_eq!(
+        out, "a$'\\t'b$'\\n'$'\\n'c\n$'\\033'\\[1m$'\\001'$'\\177' $'\\C-[[1m\\C-A\\C-?'\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
 fn break_and_continue_outside_a_loop_are_fatal() {
     for cmd in [
         "break",

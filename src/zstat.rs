@@ -103,7 +103,8 @@ fn format_mode(mode: libc::mode_t) -> String {
 }
 
 fn format_time(sec: i64, gmt: bool, fmt: &str) -> String {
-    let t = sec;
+    // The platform's time_t: 32 bits on some targets.
+    let t = sec as _;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         if gmt {
