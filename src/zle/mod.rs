@@ -246,16 +246,25 @@ pub fn zle_active() -> bool {
     ZLE_ACTIVE.with(|a| a.get())
 }
 
+struct ActiveGuard(*mut Zle);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|a| a.set(self.0));
+    }
+}
+
 /// Runs `f` on the line editor's state, from shell code a widget runs.
 /// None when no widget is running.
 pub fn with_active<R>(f: impl FnOnce(&mut Zle) -> R) -> Option<R> {
-    let p = ACTIVE.with(|a| a.get());
+    let p = ACTIVE.with(|a| a.replace(std::ptr::null_mut()));
     if p.is_null() {
         return None;
     }
-    // SAFETY: the pointer was made from the `&mut Zle` handed to
-    // `Zle::shell`, which is not used again until the shell code it
-    // runs (this call included) returns.
+    let _guard = ActiveGuard(p);
+    // SAFETY: `p` came from `Zle::shell`'s `&mut Zle`, and `ACTIVE` is
+    // cleared while `f` executes so no re-entrant call can alias `&mut *p`
+    // unless it explicitly reborrows via `Zle::shell`.
     Some(f(unsafe { &mut *p }))
 }
 
@@ -352,10 +361,8 @@ impl Zle {
 
     /// Runs shell code that may call back into the line editor.
     pub fn shell<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        let prev = ACTIVE.with(|a| a.replace(self as *mut Zle));
-        let r = f();
-        ACTIVE.with(|a| a.set(prev));
-        r
+        let _guard = ActiveGuard(ACTIVE.with(|a| a.replace(self as *mut Zle)));
+        f()
     }
 
     pub fn ll(&self) -> usize {
@@ -1061,21 +1068,22 @@ fn set_raw(fd: i32) -> Option<libc::termios> {
         }
         let saved = t;
         EOFCHAR.with(|e| e.set(t.c_cc[libc::VEOF] as i32));
+        let vdisable = libc::_POSIX_VDISABLE as libc::cc_t;
         if !crate::options::is_set("flowcontrol") {
             t.c_iflag &= !libc::IXON;
-            t.c_cc[libc::VSTART] = 0;
-            t.c_cc[libc::VSTOP] = 0;
+            t.c_cc[libc::VSTART] = vdisable;
+            t.c_cc[libc::VSTOP] = vdisable;
         }
         t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::FLUSHO);
         t.c_oflag &= !libc::TABDLY;
         t.c_oflag |= libc::ONLCR;
         for c in [libc::VQUIT, libc::VDISCARD, libc::VSUSP, libc::VLNEXT] {
-            t.c_cc[c] = 0;
+            t.c_cc[c] = vdisable;
         }
         // BSD and macOS also reserve ^Y (delayed suspend) in the line discipline.
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         {
-            t.c_cc[libc::VDSUSP] = 0;
+            t.c_cc[libc::VDSUSP] = vdisable;
         }
         t.c_cc[libc::VMIN] = 1;
         t.c_cc[libc::VTIME] = 0;
@@ -1136,7 +1144,29 @@ pub fn zleread(
     }
     // Terminal queries set their own modes, so this comes before raw mode.
     termctl::on_read_start(&mut z);
+    struct ZleReadGuard {
+        fd: i32,
+        saved: Option<libc::termios>,
+        editing: bool,
+    }
+    impl Drop for ZleReadGuard {
+        fn drop(&mut self) {
+            if self.editing {
+                termctl::end_edit();
+            }
+            if let Some(t) = self.saved.take() {
+                restore_term(self.fd, &t);
+            }
+            ZLE_ACTIVE.with(|a| a.set(false));
+        }
+    }
+
     z.saved_termios = set_raw(fd);
+    let mut term_guard = ZleReadGuard {
+        fd,
+        saved: z.saved_termios,
+        editing: false,
+    };
     ZLE_ACTIVE.with(|a| a.set(true));
     if crate::options::is_set("promptcr") {
         refresh::write_tty("\r");
@@ -1148,6 +1178,7 @@ pub fn zleread(
         z.redrawhook();
     }
     termctl::start_edit();
+    term_guard.editing = true;
     z.zrefresh();
     z.zlecore();
     let interrupted = z.errflag;
@@ -1161,6 +1192,7 @@ pub fn zleread(
         crate::shell::var_set(name, &l, false);
     }
     termctl::end_edit();
+    term_guard.editing = false;
     if z.done && !exit_pending() && !z.errflag {
         z.callhook(finish, None);
     }
@@ -1168,9 +1200,10 @@ pub fn zleread(
     z.invalidatelist();
     z.trash();
     if let Some(t) = z.saved_termios.take() {
+        term_guard.saved = None;
         restore_term(fd, &t);
     }
-    ZLE_ACTIVE.with(|a| a.set(false));
+    drop(term_guard);
     PENDING_INPUT.with(|p| p.replace(std::mem::take(&mut z.unget)));
     if z.eofsent || z.errflag || exit_pending() {
         if interrupted {

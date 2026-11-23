@@ -774,7 +774,7 @@ impl Matcher<'_> {
             seen = from.clone();
         }
         let mut cur = from.clone();
-        let limit = self.s.len() + min + 1;
+        let limit = self.s.len().saturating_add(min).saturating_add(1);
         for n in 1..=limit {
             if max.is_some_and(|m| n > m) {
                 break;
@@ -785,6 +785,15 @@ impl Matcher<'_> {
                 next.retain(|q, e| seen.get(q).is_none_or(|g| *g > *e));
             }
             if next.is_empty() {
+                break;
+            }
+            if next == cur {
+                // Fixed point: repeating further yields identical states.
+                if max.is_none_or(|m| min <= m) {
+                    for (&q, &e) in &next {
+                        add(&mut out, q, e);
+                    }
+                }
                 break;
             }
             for (&q, &e) in &next {

@@ -934,7 +934,24 @@ fn cbreak(fd: i32) -> Option<libc::termios> {
 fn probe(z: &mut Zle, query: &str, states: &[u8], mut handle: impl FnMut(u8, &[i32], &[u8])) {
     let at = |i: usize| states.get(i).copied().unwrap_or(0);
     let ms = query_timeout_ms(z);
-    let saved = cbreak(z.fd);
+    struct CbreakGuard {
+        fd: i32,
+        saved: Option<libc::termios>,
+    }
+    impl Drop for CbreakGuard {
+        fn drop(&mut self) {
+            if let Some(t) = self.saved.take() {
+                // SAFETY: restores the settings read in cbreak().
+                unsafe {
+                    libc::tcsetattr(self.fd, libc::TCSADRAIN, &t);
+                }
+            }
+        }
+    }
+    let _cbreak_guard = CbreakGuard {
+        fd: z.fd,
+        saved: cbreak(z.fd),
+    };
     write_tty(query);
     flush_tty();
     write_pwd();
@@ -1158,12 +1175,6 @@ fn probe(z: &mut Zle, query: &str, states: &[u8], mut handle: impl FnMut(u8, &[i
 
     if current > 0 {
         z.ungetbytes(&buf[..current]);
-    }
-    if let Some(t) = saved {
-        // SAFETY: restores the settings read in cbreak().
-        unsafe {
-            libc::tcsetattr(z.fd, libc::TCSADRAIN, &t);
-        }
     }
 }
 

@@ -311,9 +311,23 @@ pub fn on_read_refresh(name: &str, level: usize) {
     }
 }
 
+fn ensure_open_for_write(db: &mut TiedDb) -> bool {
+    let pid = std::process::id();
+    if db.open_pid != pid {
+        // After fork, reopen rather than sharing the parent's GDBM_FILE
+        // handle and open file description.
+        db.dbf = std::ptr::null_mut();
+        if let Some(new_dbf) = open_handle(&db.path, db.readonly) {
+            db.dbf = new_dbf;
+            db.open_pid = pid;
+        }
+    }
+    !db.dbf.is_null()
+}
+
 pub fn on_set_key(name: &str, level: usize, key: &str, val: &str) {
     with_tied_mut(name, level, |a, db| {
-        if db.readonly || db.dbf.is_null() {
+        if db.readonly || !ensure_open_for_write(db) {
             return;
         }
         let kb = zstr_to_bytes(key);
@@ -336,7 +350,7 @@ pub fn on_set_key(name: &str, level: usize, key: &str, val: &str) {
 
 pub fn on_del_key(name: &str, level: usize, key: &str) {
     with_tied_mut(name, level, |a, db| {
-        if db.readonly {
+        if db.readonly || !ensure_open_for_write(db) {
             return;
         }
         let kb = zstr_to_bytes(key);
@@ -354,7 +368,7 @@ pub fn on_del_key(name: &str, level: usize, key: &str) {
 
 pub fn on_replace_all(name: &str, level: usize, map: &BTreeMap<String, String>) {
     with_tied_mut(name, level, |a, db| {
-        if db.readonly {
+        if db.readonly || !ensure_open_for_write(db) {
             return;
         }
         // Delete all existing keys first.
@@ -395,7 +409,7 @@ pub fn on_replace_all(name: &str, level: usize, map: &BTreeMap<String, String>) 
 
 pub fn on_append_all(name: &str, level: usize, map: &BTreeMap<String, String>) {
     with_tied_mut(name, level, |a, db| {
-        if db.readonly {
+        if db.readonly || !ensure_open_for_write(db) {
             return;
         }
         for (ks, vs) in map {

@@ -15,17 +15,18 @@ struct Out {
     stderr: String,
 }
 
-fn run(args: &[&str], stdin: &str, cwd: Option<&std::path::Path>) -> Out {
+fn run_mode(emulate_sh: bool, args: &[&str], stdin: &str, cwd: Option<&std::path::Path>) -> Out {
     let home = TempDir::new().expect("tempdir for HOME");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_meowsh"));
     // Own process group, so a timeout can kill forked children that would
     // otherwise keep the output pipes open.
-    cmd.process_group(0)
-        .env("HOME", home.path())
+    cmd.process_group(0).env("HOME", home.path());
+    if emulate_sh {
         // These are POSIX behaviors; zsh mode differs (no word splitting
         // of parameters, no-match errors).
-        .args(["--emulate", "sh"])
-        .args(args)
+        cmd.args(["--emulate", "sh"]);
+    }
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -310,8 +311,145 @@ fn script_dies_on_sigterm_and_sigint() {
     }
 }
 
+fn run(args: &[&str], stdin: &str, cwd: Option<&std::path::Path>) -> Out {
+    run_mode(true, args, stdin, cwd)
+}
+
+fn zsh(script: &str) -> Out {
+    run_mode(false, &["-c", script], "", None)
+}
+
 #[test]
 fn trapped_signal_runs_action() {
     let o = sh("trap 'echo caught' USR1; kill -USR1 $$; echo after");
     assert_eq!(o.stdout, "caught\nafter\n");
+}
+
+#[test]
+fn subshell_in_trap_can_run_traps() {
+    let o = zsh(
+        r#"zmodload zsh/system; trap '( trap "echo sub" USR1; kill -USR1 $sysparams[pid] )' USR2; kill -USR2 $$"#,
+    );
+    assert_eq!(o.stdout, "sub\n");
+}
+
+// Critical bug regressions
+
+#[test]
+fn invalid_typeset_base_ulimit_and_cd_zero_do_not_panic() {
+    let o = zsh("typeset -i 1 x=5; echo $x; typeset -i 37 y=5; echo $y");
+    assert!(o.signal.is_none());
+    assert_eq!(o.stdout, "5\n5\n");
+
+    let o = zsh("ulimit -N 999; echo $?");
+    assert!(o.signal.is_none());
+    assert_eq!(o.stdout, "1\n");
+
+    let o = zsh("cd +0; cd -0; echo ok");
+    assert!(o.signal.is_none());
+    assert_eq!(o.stdout, "ok\n");
+}
+
+#[test]
+fn expansion_and_arith_edge_cases_do_not_panic_or_loop() {
+    let o = zsh("s=abc; echo ${s:1:9223372036854775807}");
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "bc\n");
+
+    let o = zsh("s=abc; echo ${s[(n:-9223372036854775808)r]a}");
+    assert!(o.signal.is_none());
+
+    let o = zsh("s=abc; echo ${s[(n:-9223372036854775808)ra]}");
+    assert!(o.signal.is_none());
+
+    let o = zsh("x=y; y=1; echo ${${(P)x}[}");
+    assert!(o.signal.is_none());
+    assert_ne!(o.status, Some(0));
+
+    let o = zsh("a='$a'; echo $(( [$a] 1 ))");
+    assert!(o.signal.is_none());
+
+    let o = zsh("echo ${999999999999999:=x}");
+    assert!(o.signal.is_none());
+    assert_ne!(o.status, Some(0));
+
+    let o = zsh("x=a; : ${x:fs/a/aa/}; echo ok");
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "ok\n");
+
+    let o = zsh("echo $(( (-9223372036854775807 - 1) ** 65 ))");
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "0\n");
+}
+
+#[test]
+fn pattern_repeat_large_counts_do_not_overflow_or_hang() {
+    let o = zsh(r#"setopt extendedglob; [[ a == a(#c18446744073709551615) ]]; echo $?"#);
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "1\n");
+
+    let o = zsh(r#"setopt extendedglob; [[ "" == (a|)(#c1000000000000) ]]; echo $?"#);
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "0\n");
+}
+
+#[test]
+fn eval_recursion_is_bounded() {
+    let o = zsh(r#"x='eval "$x"'; eval "$x"; echo survived"#);
+    assert!(o.signal.is_none());
+    assert!(o.stdout.contains("survived"));
+}
+
+#[test]
+fn closed_stdio_fds_work_in_pipelines_and_both_redir() {
+    let o = zsh("exec 0<&-; echo hi | cat");
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "hi\n");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let out = tmp.path().join("both.txt");
+    let script = format!("exec 2>&-; echo hello >&{}", out.display());
+    let o = zsh(&script);
+    assert_eq!(o.status, Some(0));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello\n");
+}
+
+#[test]
+fn multios_on_high_fd_does_not_deadlock() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    let script = format!(
+        "/usr/bin/true 10>{} 10>{}; echo done",
+        a.display(),
+        b.display()
+    );
+    let o = zsh(&script);
+    assert_eq!(o.status, Some(0));
+    assert_eq!(o.stdout, "done\n");
+}
+
+#[test]
+fn zpty_child_does_not_run_parent_exit_trap() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("exit.log");
+    let script = format!(
+        "zmodload zsh/zpty; trap 'echo EXIT >> {}' EXIT; zpty p 'true'; zpty -w p ''; zpty -d p",
+        log.display()
+    );
+    let o = zsh(&script);
+    assert_eq!(o.status, Some(0));
+    let lines: Vec<_> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines, vec!["EXIT"]);
+}
+
+#[test]
+fn systell_rejects_fd_above_i32_max() {
+    let o = zsh("zmodload zsh/system; echo $(( systell(4294967296) ))");
+    assert!(o.signal.is_none());
+    assert_ne!(o.status, Some(0));
 }

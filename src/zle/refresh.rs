@@ -558,7 +558,7 @@ impl RefreshState {
                     }
                 }
             } else if iswprint(c) && width > 0 {
-                if width as usize > rp.sen - rp.s {
+                if width as usize > rp.sen.saturating_sub(rp.s) {
                     // Too wide to fit: pad to the end of the line.
                     loop {
                         self.set(rp.ln, rp.s, rc(' ' as u32, all_attr));
@@ -803,7 +803,7 @@ impl RefreshState {
             }
         } else {
             // `>....` on the first line when there is text before it.
-            let lw = self.lpromptw as usize;
+            let lw = (self.lpromptw as usize).min(winw);
             let (pad, prompt_attr, ellipsis_attr) =
                 (self.pad(), self.prompt_attr, self.hl.ellipsis_attr);
             let line = self.nline(0);
@@ -811,12 +811,16 @@ impl RefreshState {
                 *cell = ZR_SP;
             }
             let t0 = (winw - lw).min(5);
-            line[lw..lw + t0].clone_from_slice(&start_ellipsis()[..t0]);
-            line[lw].atr = ellipsis_attr;
+            if t0 > 0 {
+                line[lw..lw + t0].clone_from_slice(&start_ellipsis()[..t0]);
+                line[lw].atr = ellipsis_attr;
+            }
             for cell in &mut line[lw + t0..winw] {
                 *cell = pad.clone();
             }
-            line[lw + t0].atr = prompt_attr;
+            if lw + t0 < winw {
+                line[lw + t0].atr = prompt_attr;
+            }
             line[winw] = ZR_ZR;
             line[winw + 1] = ZR_ZR;
         }
@@ -1806,7 +1810,7 @@ impl Zle {
 
         (r.lpromptwof, r.lprompth) = countprompt(&r.lpromptbuf, 1);
         (r.rpromptw, r.rprompth) = countprompt(&r.rpromptbuf, 0);
-        if r.lpromptwof != r.winw {
+        if r.lpromptwof < r.winw {
             r.lpromptw = r.lpromptwof;
         } else {
             r.lpromptw = 0;

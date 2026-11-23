@@ -1142,7 +1142,11 @@ fn set_width_base(p: &mut Param, on: u32, ops: &Opts) {
     }
     if on & INTEGER != 0 {
         if let Some(n) = arg('i') {
-            p.base = n as u32;
+            if n == 0 || (2..=36).contains(&n) {
+                p.base = n as u32;
+            } else {
+                crate::shell::builtin_err("typeset", "invalid base (must be 2 to 36 inclusive)");
+            }
         }
     } else if on & FLOAT_E != 0 {
         if let Some(n) = arg('E') {

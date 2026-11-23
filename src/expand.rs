@@ -759,16 +759,20 @@ fn group_digits(d: &str, g: usize, from_left: bool) -> String {
 // `$(( [#base_group] expr ))`: the output base (`##` drops the prefix)
 // and digit grouping with underscores.
 fn arith_text(expr: &[char]) -> ExpResult<String> {
+    arith_text_depth(expr, 0)
+}
+
+fn arith_text_depth(expr: &[char], depth: usize) -> ExpResult<String> {
     let s: String = expr.iter().collect();
     let t = s.trim_start();
     // `[$fmt]`: the base spec may come from a parameter.
-    if t.starts_with('[') && !t.starts_with("[#") {
+    if depth < 16 && t.starts_with('[') && !t.starts_with("[#") {
         if let Some(close) = t.find(']') {
             let inner: Vec<char> = t[1..close].chars().collect();
             if inner.contains(&'$') {
                 let spec = word_string(&inner, Mode::Dq)?;
                 let rebuilt: Vec<char> = format!("[{}]{}", spec, &t[close + 1..]).chars().collect();
-                return arith_text(&rebuilt);
+                return arith_text_depth(&rebuilt, depth + 1);
             }
         }
     }
@@ -1673,7 +1677,7 @@ fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
     }
     if f.num < 0 {
         f.down = !f.down;
-        f.num = -f.num;
+        f.num = f.num.saturating_neg();
     }
     let close = rest.char_indices().nth(i).map(|(b, _)| b)?;
     Some((f, &rest[close + 1..]))
@@ -1828,7 +1832,7 @@ fn search_chars(s: &str, f: &SubSearch, word: &str, a2: bool) -> ExpResult<i64> 
         let found: Vec<usize> = (0..=last as usize)
             .filter(|&t| t <= chars.len() && test(t))
             .collect();
-        if found.len() as i64 >= num {
+        if num > 0 && found.len() as i64 >= num {
             let t = found[found.len() - num as usize] as i64;
             return Ok(if a2 { t } else { t + 1 });
         }
@@ -2329,7 +2333,7 @@ fn parse_modifiers(rest: &[char], inbrace: bool) -> ExpResult<(Vec<Modifier>, us
                     i += 1;
                     if inbrace {
                         while let Some(d) = rest.get(i).and_then(|c| c.to_digit(10)) {
-                            m.count = m.count * 10 + d as usize;
+                            m.count = m.count.saturating_mul(10).saturating_add(d as usize);
                             i += 1;
                         }
                     }
@@ -2657,13 +2661,14 @@ fn apply_modifier(m: &Modifier, s: &str, subst: &Option<(String, String)>) -> St
     };
     if m.rec < 0 {
         let mut cur = s.to_string();
-        loop {
+        for _ in 0..10_000 {
             let next = once(&cur);
-            if next == cur {
-                return cur;
+            if next == cur || next.len() > 10_000_000 {
+                return next;
             }
             cur = next;
         }
+        return cur;
     }
     let mut cur = s.to_string();
     for _ in 0..m.rec {
@@ -3385,6 +3390,9 @@ fn dopadding(
     let (preone, postone, premul, postmul) = (one(preone), one(postone), mul(premul), mul(postmul));
     let s: Vec<char> = s.chars().collect();
     let ls = s.len();
+    const MAX_PAD_WIDTH: usize = 1_000_000;
+    let prenum = prenum.min(MAX_PAD_WIDTH);
+    let postnum = postnum.min(MAX_PAD_WIDTH);
     if prenum + postnum == ls {
         return s.iter().collect();
     }
@@ -4175,6 +4183,9 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                     // Let the outer subscript act on the parameter itself.
                     name = n;
                     let k = scan_bracket_end(body, end);
+                    if k <= end || body.get(k) != Some(&']') {
+                        return bad();
+                    }
                     sub = Some(body[end + 1..k].iter().collect());
                     i = k + 1;
                     param_value(&name, sub.as_deref())?
@@ -4674,6 +4685,13 @@ fn assign_word(
         return fail(&format!("${{{}}}: cannot assign in this way", text));
     }
     if let Some(n) = positional {
+        const MAX_POS_PARAMS: usize = 65_536;
+        if n > MAX_POS_PARAMS {
+            return fail(&format!(
+                "${{{}}}: positional parameter index too large",
+                text
+            ));
+        }
         let v = word_string(word, mode)?;
         with_shell(|s| {
             if s.pos_params.len() < n {
@@ -5089,13 +5107,13 @@ fn expand_braced(body: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
 fn slice<T: Clone>(items: &[T], off: i64, len: Option<i64>) -> Vec<T> {
     let n = items.len() as i64;
     let start = if off < 0 {
-        (n + off).max(0)
+        n.saturating_add(off).max(0)
     } else {
         off.min(n)
     };
     let end = match len {
-        Some(l) if l < 0 => (n + l).max(start),
-        Some(l) => (start + l).min(n),
+        Some(l) if l < 0 => n.saturating_add(l).max(start),
+        Some(l) => start.saturating_add(l).min(n),
         None => n,
     };
     items[start as usize..end as usize].to_vec()

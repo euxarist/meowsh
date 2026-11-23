@@ -2373,7 +2373,7 @@ fn cd_new_pwd(
     let mut new_pwd = list.remove(idx);
     if kind == CdKind::Popd && !list.is_empty() {
         new_pwd = list.remove(0);
-    } else if kind == CdKind::Cd && !crate::options::is_set("autopushd") {
+    } else if kind == CdKind::Cd && !crate::options::is_set("autopushd") && !list.is_empty() {
         list.remove(0);
     }
     if crate::options::is_set("pushdignoredups") {
@@ -3699,16 +3699,21 @@ const LIMITS: &[(&str, char, LimKind, &str, libc::c_int)] = &[
 ];
 
 fn get_limit(res: usize, hard: bool) -> Option<u64> {
+    let entry = LIMITS.get(res)?;
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(LIMITS[res].4 as _, &mut lim) } != 0 {
+    if unsafe { libc::getrlimit(entry.4 as _, &mut lim) } != 0 {
         return None;
     }
     Some(if hard { lim.rlim_max } else { lim.rlim_cur } as u64)
 }
 
 fn set_limit(name: &str, res: usize, hard: bool, soft: bool, val: u64) -> bool {
+    let Some(entry) = LIMITS.get(res) else {
+        builtin_err(name, &format!("invalid resource number: {}", res));
+        return false;
+    };
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(LIMITS[res].4 as _, &mut lim) } != 0 {
+    if unsafe { libc::getrlimit(entry.4 as _, &mut lim) } != 0 {
         return false;
     }
     if hard {
@@ -3717,7 +3722,7 @@ fn set_limit(name: &str, res: usize, hard: bool, soft: bool, val: u64) -> bool {
     if soft {
         lim.rlim_cur = val as libc::rlim_t;
     }
-    if unsafe { libc::setrlimit(LIMITS[res].4 as _, &lim) } != 0 {
+    if unsafe { libc::setrlimit(entry.4 as _, &lim) } != 0 {
         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         builtin_err(
             name,
@@ -3783,7 +3788,11 @@ fn builtin_ulimit(words: &[String]) -> i32 {
                         return 1;
                     };
                     match spec.parse::<usize>() {
-                        Ok(n) => chosen.push((n, None)),
+                        Ok(n) if n < LIMITS.len() => chosen.push((n, None)),
+                        Ok(_) => {
+                            builtin_err("ulimit", &format!("no such limit: {}", spec));
+                            return 1;
+                        }
                         Err(_) => {
                             builtin_err("ulimit", &format!("invalid number: {}", spec));
                             return 1;

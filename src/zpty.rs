@@ -26,13 +26,19 @@ fn with_cmds<R>(f: impl FnOnce(&mut Vec<PtyCmd>) -> R) -> R {
 // A master/slave pseudo-terminal pair: (master fd, slave path).
 fn open_pty() -> Option<(i32, std::ffi::CString)> {
     unsafe {
-        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        let mut m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
         if m < 0 {
             return None;
         }
-        // Only the shell talks to the master; commands it runs must not
-        // hold it, or they could type into the session.
-        libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
+        // Keep the master out of 0..=2 and closed on exec so children do
+        // not clobber stdio or inherit it.
+        let hi = libc::fcntl(m, libc::F_DUPFD_CLOEXEC, 10);
+        if hi >= 0 {
+            libc::close(m);
+            m = hi;
+        } else {
+            libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
         if libc::grantpt(m) != 0 || libc::unlockpt(m) != 0 {
             libc::close(m);
             return None;
@@ -101,14 +107,28 @@ fn new_cmd(name: &str, args: &[String], echo: bool, nblock: bool) -> i32 {
             if slave > 2 {
                 libc::close(slave);
             }
-            libc::close(master);
+            if master > 2 {
+                libc::close(master);
+            }
         }
+        // Drop inherited pty masters so the child cannot close or signal them.
+        with_cmds(|c| {
+            for p in c.drain(..) {
+                if p.fd > 2 {
+                    unsafe {
+                        libc::close(p.fd);
+                    }
+                }
+            }
+        });
         // Tell the parent the terminal is ready, then run the command.
         let _ = crate::sys::write_fd(1, &[0u8]);
         crate::shell::with_shell(|s| {
             crate::options::set_in(s, "interactive", false);
             s.interactive = false;
+            s.in_subshell = true;
         });
+        crate::trap::reset_in_child(false);
         let st = crate::exec::run_string(&src);
         crate::exec::exit_shell(st);
     }
@@ -250,6 +270,24 @@ fn read(name: &str, args: &[String], noblock: bool, mustmatch: bool) -> i32 {
                 if r < 0 {
                     let e = std::io::Error::last_os_error();
                     if e.kind() != std::io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    // Non-blocking pty without `-t`: wait for input instead of
+                    // spinning at 100% CPU.
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
+                    if pr < 0 {
+                        let pe = std::io::Error::last_os_error();
+                        if pe.kind() != std::io::ErrorKind::Interrupted {
+                            break;
+                        }
+                    } else if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+                        && pfd.revents & libc::POLLIN == 0
+                    {
                         break;
                     }
                 }

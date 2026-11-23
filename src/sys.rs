@@ -201,7 +201,19 @@ pub fn temp_file_with(data: &[u8]) -> io::Result<i32> {
 
 /// Runs `f` with standard error sent to /dev/null.
 pub fn with_stderr_silenced<R>(f: impl FnOnce() -> R) -> R {
-    let saved = unsafe { libc::dup(2) };
+    struct RestoreStderr(i32);
+    impl Drop for RestoreStderr {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe {
+                    libc::dup2(self.0, 2);
+                    libc::close(self.0);
+                }
+            }
+        }
+    }
+    let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 10) };
+    let _guard = RestoreStderr(saved);
     let null = std::fs::OpenOptions::new().write(true).open("/dev/null");
     if let Ok(n) = &null {
         use std::os::fd::AsRawFd;
@@ -209,14 +221,7 @@ pub fn with_stderr_silenced<R>(f: impl FnOnce() -> R) -> R {
             libc::dup2(n.as_raw_fd(), 2);
         }
     }
-    let r = f();
-    if saved >= 0 {
-        unsafe {
-            libc::dup2(saved, 2);
-            libc::close(saved);
-        }
-    }
-    r
+    f()
 }
 
 #[cfg(test)]
