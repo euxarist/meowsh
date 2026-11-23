@@ -314,9 +314,9 @@ pub fn on_read_refresh(name: &str, level: usize) {
 fn ensure_open_for_write(db: &mut TiedDb) -> bool {
     let pid = std::process::id();
     if db.open_pid != pid {
-        // After fork, reopen rather than sharing the parent's GDBM_FILE
-        // handle and open file description.
-        db.dbf = std::ptr::null_mut();
+        // After fork, prefer a fresh handle. While the parent holds the
+        // writer lock the reopen fails; then write through the inherited
+        // handle, as zsh does.
         if let Some(new_dbf) = open_handle(&db.path, db.readonly) {
             db.dbf = new_dbf;
             db.open_pid = pid;
