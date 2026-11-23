@@ -2167,6 +2167,22 @@ zuntie -u dbase
 }
 
 #[test]
+fn typeset_invalid_integer_base_fails_compat() {
+    let (st, out, err) = sh(r#"
+typeset -i 1 x; print "st=$?"; (( ${+x} )) || print "x unset"
+typeset -i 0 z; print "st=$?"; (( ${+z} )) || print "z unset"
+typeset -i 2 w=5; typeset -i 37 w; print "st=$?"; typeset -p w
+"#);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "st=1\nx unset\nst=1\nz unset\nst=1\ntypeset -i2 w=5\n");
+    assert!(
+        err.contains("invalid base (must be 2 to 36 inclusive): 37"),
+        "err={:?}",
+        err
+    );
+}
+
+#[test]
 fn ostype_exepath_and_options_assoc_sync_compat() {
     let (st, out, err) = sh(r#"
 print "os=$OSTYPE"

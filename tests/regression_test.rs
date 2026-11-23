@@ -339,7 +339,8 @@ fn subshell_in_trap_can_run_traps() {
 fn invalid_typeset_base_ulimit_and_cd_zero_do_not_panic() {
     let o = zsh("typeset -i 1 x=5; echo $x; typeset -i 37 y=5; echo $y");
     assert!(o.signal.is_none());
-    assert_eq!(o.stdout, "5\n5\n");
+    // zsh rejects the base and leaves the parameter unset.
+    assert_eq!(o.stdout, "\n\n");
 
     let o = zsh("ulimit -N 999; echo $?");
     assert!(o.signal.is_none());

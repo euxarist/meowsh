@@ -721,6 +721,17 @@ fn typeset_single(
         crate::exec::abort_command(1);
         return false;
     }
+    if on & INTEGER != 0 {
+        if let Some(n) = ops.arg('i').and_then(|a| a.parse::<i64>().ok()) {
+            if !(2..=36).contains(&n) {
+                warn(
+                    cmd,
+                    &format!("invalid base (must be 2 to 36 inclusive): {}", n),
+                );
+                return false;
+            }
+        }
+    }
     // $status stays the read-only special, even made local (but -h hides it).
     if base_name == "status"
         && on & HIDE == 0
@@ -1142,11 +1153,7 @@ fn set_width_base(p: &mut Param, on: u32, ops: &Opts) {
     }
     if on & INTEGER != 0 {
         if let Some(n) = arg('i') {
-            if n == 0 || (2..=36).contains(&n) {
-                p.base = n as u32;
-            } else {
-                crate::shell::builtin_err("typeset", "invalid base (must be 2 to 36 inclusive)");
-            }
+            p.base = n as u32;
         }
     } else if on & FLOAT_E != 0 {
         if let Some(n) = arg('E') {
