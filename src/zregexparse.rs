@@ -386,7 +386,7 @@ fn rmatch(
             st = Some(br.state);
             nexts = Nexts::State(br.state);
             if next.cutoff == '-' || (next.cutoff == '/' && len != 0) {
-                nextslist = Vec::new();
+                nextslist.clear();
                 point1 = point2;
                 setiparam(var1, point1);
             }
