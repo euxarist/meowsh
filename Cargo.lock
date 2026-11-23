@@ -9,15 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "buffer-redux"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "431a9cc8d7efa49bc326729264537f5e60affce816c66edf434350778c9f4f54"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,11 +169,8 @@ dependencies = [
 [[package]]
 name = "rustyline"
 version = "19.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56e1d6bd81c2d5feafd2419138df9183c45a10a492c4e873b8b0acb8eb2b549e"
 dependencies = [
  "bitflags",
- "buffer-redux",
  "clipboard-win",
  "home",
  "libc",

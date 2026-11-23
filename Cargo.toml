@@ -6,7 +6,7 @@ license = "Unlicense"
 
 [dependencies]
 libc = "0.2"
-rustyline = { version = "19", features = ["buffer-redux"] }
+rustyline = "19"
 
 [profile.release]
 lto = true
@@ -15,3 +15,9 @@ panic = "abort"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# rustyline 19.0.0 with its terminal reads changed: a byte at a time, and CR
+# and NL swapped as zsh does,
+# so input typed ahead stays there for the command that runs next.
+[patch.crates-io]
+rustyline = { path = "vendor/rustyline" }

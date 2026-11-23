@@ -860,6 +860,18 @@ fn input_typed_ahead_of_the_prompt_is_kept() {
 }
 
 #[test]
+fn input_typed_ahead_of_a_command_goes_to_that_command() {
+    // All three lines arrive in one read. The second belongs to `read`;
+    // the editor used to take it and run it as a command afterwards.
+    let out = on_terminal(
+        "PROMPT='> '\n",
+        "read -r v\rtyped\rprint \"v=$v [ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("v=typed [right]"), "output: {:?}", out);
+    assert!(!out.contains("command not found"), "output: {:?}", out);
+}
+
+#[test]
 fn read_k_honours_its_timeout() {
     // The harness for zsh's ZLE tests waits this way between keys; it
     // used to block until the writer went away.
