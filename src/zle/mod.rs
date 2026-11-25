@@ -430,12 +430,24 @@ impl Zle {
                 }
                 left as i32
             };
-            let mut pfd = libc::pollfd {
+            let watches: Vec<(i32, String, bool)> = thingy::watch_fds()
+                .into_iter()
+                .filter(|(fd, _, _)| *fd != self.fd)
+                .collect();
+            let mut pfds = Vec::with_capacity(1 + watches.len());
+            pfds.push(libc::pollfd {
                 fd: self.fd,
                 events: libc::POLLIN,
                 revents: 0,
-            };
-            let r = unsafe { libc::poll(&mut pfd, 1, wait) };
+            });
+            for (fd, _, _) in &watches {
+                pfds.push(libc::pollfd {
+                    fd: *fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, wait) };
             if r < 0 {
                 let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if e == libc::EINTR {
@@ -448,6 +460,30 @@ impl Zle {
             }
             if r == 0 {
                 return Err(true);
+            }
+            let mut handled_watch = false;
+            for ((fd, func, is_widget), pfd) in watches.iter().zip(pfds[1..].iter()) {
+                if pfd.revents == 0 {
+                    continue;
+                }
+                handled_watch = true;
+                let mut args = vec![fd.to_string()];
+                if pfd.revents & libc::POLLNVAL != 0 {
+                    thingy::remove_watch_fd(*fd);
+                    args.push("nval".to_string());
+                } else if pfd.revents & libc::POLLERR != 0 {
+                    args.push("err".to_string());
+                } else if pfd.revents & libc::POLLHUP != 0 && pfd.revents & libc::POLLIN == 0 {
+                    args.push("hup".to_string());
+                }
+                if *is_widget {
+                    self.execzlefunc(func, &args, true, false);
+                } else {
+                    self.call_user_widget(func, &args);
+                }
+            }
+            if handled_watch && pfds[0].revents == 0 {
+                continue;
             }
             let mut b = [0u8; 1];
             let n = unsafe { libc::read(self.fd, b.as_mut_ptr() as *mut libc::c_void, 1) };

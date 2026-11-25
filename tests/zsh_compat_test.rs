@@ -2259,3 +2259,18 @@ print -r -- "at:${${(@)arr}[2]}"
     );
     assert!(err.is_empty(), "err={:?}", err);
 }
+
+#[test]
+fn history_reverse_search_returns_most_recent_match() {
+    let (st, out, err) = sh(r#"
+zmodload zsh/parameter
+fc -p /dev/null 100 100
+for i in {1..12}; do
+    print -s "echo item-$i"
+done
+print -r -- "${history[(r)echo*]}"
+"#);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "echo item-12\n");
+    assert!(err.is_empty(), "err={:?}", err);
+}

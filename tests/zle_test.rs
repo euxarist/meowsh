@@ -153,3 +153,29 @@ fn bracketed_paste_magic_quotes_pasted_url() {
         out
     );
 }
+
+#[test]
+fn zle_f_fd_handler_runs_while_waiting_for_input() {
+    let rc = r#"KEYTIMEOUT=1
+on_fd() {
+    local sug
+    IFS='' read -rd '' -u "$1" sug
+    POSTDISPLAY="$sug"
+    builtin exec {1}<&-
+    zle -F "$1"
+    zle -R
+    print -r "[B=$BUFFER P=$POSTDISPLAY]"
+    BUFFER=
+    zle accept-line
+}
+start_async() {
+    local fd
+    builtin exec {fd}< <(print -rn -- "suggestion")
+    zle -F "$fd" on_fd
+}
+zle -N start_async
+bindkey '^A' start_async
+"#;
+    let out = on_terminal(rc, "ec\x01");
+    assert!(out.contains("[B=ec P=suggestion]"), "output: {:?}", out);
+}

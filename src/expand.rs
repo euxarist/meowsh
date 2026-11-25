@@ -2174,7 +2174,16 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     // value of the first (or of every) matching key.
     if let Some((flags, word)) = search_flags(sub).filter(|(f, _)| f.contains(['k', 'K'])) {
         let text = assoc_key(word)?;
-        let keys = assoc_keys(name).unwrap_or_default();
+        let mut keys = assoc_keys(name).unwrap_or_default();
+        if name == "history" {
+            // zsh's $history iterates from most recent event down to 1 so
+            // ${history[(r)pat]} returns the most recent matching command.
+            keys.sort_by(|a, b| {
+                b.parse::<usize>()
+                    .unwrap_or(0)
+                    .cmp(&a.parse::<usize>().unwrap_or(0))
+            });
+        }
         let mut found = keys
             .iter()
             .filter(|k| crate::pattern::matches(k, &text))
@@ -2193,7 +2202,16 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
         let hit = matcher(word, flags.contains('e'))?;
         let last = flags.contains('I') || flags.contains('R');
         let want_value = flags.contains('r') || flags.contains('R');
-        let keys = assoc_keys(name).unwrap_or_default();
+        let mut keys = assoc_keys(name).unwrap_or_default();
+        if name == "history" {
+            // zsh's $history iterates from most recent event down to 1 so
+            // ${history[(r)pat]} returns the most recent matching command.
+            keys.sort_by(|a, b| {
+                b.parse::<usize>()
+                    .unwrap_or(0)
+                    .cmp(&a.parse::<usize>().unwrap_or(0))
+            });
+        }
         let mut found = keys.iter().filter_map(|k| {
             let v = assoc_get(name, k).unwrap_or_default();
             if want_value {

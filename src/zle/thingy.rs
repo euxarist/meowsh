@@ -584,6 +584,10 @@ pub fn watch_fds() -> Vec<(i32, String, bool)> {
     WATCH_FDS.with(|w| w.borrow().clone())
 }
 
+pub fn remove_watch_fd(fd: i32) {
+    WATCH_FDS.with(|w| w.borrow_mut().retain(|e| e.0 != fd));
+}
+
 pub fn tc_func() -> Option<String> {
     TC_FUNC.with(|t| t.borrow().clone())
 }
