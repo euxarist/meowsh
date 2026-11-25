@@ -2224,3 +2224,53 @@ options[extendedglob]=off
     assert!(out.contains("exe=ok\n"), "out={:?}", out);
     assert!(out.contains("eg=off\n"), "out={:?}", out);
 }
+
+#[test]
+fn builtin_exec_handles_fd_redirections() {
+    let (st, out, err) = sh(r#"
+builtin exec {fd}< <(print -r -- hello)
+read -r line <&$fd
+builtin exec {fd}<&-
+print -r -- "$line"
+"#);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "hello\n");
+    assert!(err.is_empty(), "err={:?}", err);
+}
+
+#[test]
+fn nested_split_keeps_array_before_outer_subscript_in_double_quotes() {
+    let (st, out, err) = sh(r#"
+a="completion:complete-word:_main_complete"
+b=$'one\ntwo\nthree'
+c="one two three"
+arr=(one two three)
+print -r -- "s:${${(s.:.)a}[2,3]}"
+print -r -- "f:${${(f)b}[2,3]}"
+print -r -- "z:${${(z)c}[2,3]}"
+print -r -- "eq:${${=c}[2,3]}"
+print -r -- "arr:${${arr}[2]}"
+print -r -- "at:${${(@)arr}[2]}"
+"#);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(
+        out,
+        "s:complete-word _main_complete\nf:two three\nz:two three\neq:two three\narr:n\nat:two\n"
+    );
+    assert!(err.is_empty(), "err={:?}", err);
+}
+
+#[test]
+fn history_reverse_search_returns_most_recent_match() {
+    let (st, out, err) = sh(r#"
+zmodload zsh/parameter
+fc -p /dev/null 100 100
+for i in {1..12}; do
+    print -s "echo item-$i"
+done
+print -r -- "${history[(r)echo*]}"
+"#);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "echo item-12\n");
+    assert!(err.is_empty(), "err={:?}", err);
+}

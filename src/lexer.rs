@@ -890,8 +890,12 @@ impl Lexer {
             while j < self.chars.len() && is_name_char(self.chars[j]) {
                 j += 1;
             }
-            if j > self.pos + 1
-                && is_name_start(self.chars[self.pos + 1])
+            let valid_var = j > self.pos + 1
+                && (is_name_start(self.chars[self.pos + 1])
+                    || self.chars[self.pos + 1..j]
+                        .iter()
+                        .all(|ch| ch.is_ascii_digit()));
+            if valid_var
                 && self.chars.get(j) == Some(&'}')
                 && matches!(self.chars.get(j + 1), Some('<' | '>'))
                 && self.chars.get(j + 2) != Some(&'(')

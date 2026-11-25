@@ -2174,7 +2174,16 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     // value of the first (or of every) matching key.
     if let Some((flags, word)) = search_flags(sub).filter(|(f, _)| f.contains(['k', 'K'])) {
         let text = assoc_key(word)?;
-        let keys = assoc_keys(name).unwrap_or_default();
+        let mut keys = assoc_keys(name).unwrap_or_default();
+        if name == "history" {
+            // zsh's $history iterates from most recent event down to 1 so
+            // ${history[(r)pat]} returns the most recent matching command.
+            keys.sort_by(|a, b| {
+                b.parse::<usize>()
+                    .unwrap_or(0)
+                    .cmp(&a.parse::<usize>().unwrap_or(0))
+            });
+        }
         let mut found = keys
             .iter()
             .filter(|k| crate::pattern::matches(k, &text))
@@ -2193,7 +2202,16 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
         let hit = matcher(word, flags.contains('e'))?;
         let last = flags.contains('I') || flags.contains('R');
         let want_value = flags.contains('r') || flags.contains('R');
-        let keys = assoc_keys(name).unwrap_or_default();
+        let mut keys = assoc_keys(name).unwrap_or_default();
+        if name == "history" {
+            // zsh's $history iterates from most recent event down to 1 so
+            // ${history[(r)pat]} returns the most recent matching command.
+            keys.sort_by(|a, b| {
+                b.parse::<usize>()
+                    .unwrap_or(0)
+                    .cmp(&a.parse::<usize>().unwrap_or(0))
+            });
+        }
         let mut found = keys.iter().filter_map(|k| {
             let v = assoc_get(name, k).unwrap_or_default();
             if want_value {
@@ -4202,15 +4220,15 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         // A nested expansion is quoted when the outer one is, so a split
         // in it keeps empty fields.
         val = braced(&body[i + 2..end - 1], mode)?;
-        // In double quotes a nested array joins unless it has its own (@)
-        // or (A).
+        // In double quotes a nested array joins unless it has its own (@),
+        // (A), or split flag (`Val::List(_, false)`).
         let inner_at = body.get(i + 2) == Some(&'(')
             && body[i + 3..end - 1]
                 .iter()
                 .take_while(|&&c| c != ')')
                 .any(|&c| c == '@' || c == 'A');
         if mode != Mode::Unquoted && !inner_at && body.get(end) == Some(&'[') {
-            if let Val::List(items, _) = &val {
+            if let Val::List(items, true) = &val {
                 val = Val::Str(items.join(&ifs_first()));
             }
         }

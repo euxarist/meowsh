@@ -992,7 +992,16 @@ fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
         });
         return Err(RedirError);
     }
-    let held = var_get(var).trim().parse::<i32>().ok();
+    let raw_val = if let Ok(idx) = var.parse::<usize>() {
+        if idx > 0 {
+            with_shell(|s| s.pos_params.get(idx - 1).cloned().unwrap_or_default())
+        } else {
+            String::new()
+        }
+    } else {
+        var_get(var)
+    };
+    let held = raw_val.trim().parse::<i32>().ok();
     let is_open = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
     if closing {
         let fd = held.unwrap_or(-1);
@@ -2415,7 +2424,7 @@ fn run_command(
     }
     let name = words[0].clone();
 
-    if name == "exec" && !skip_functions {
+    if name == "exec" && !external_only {
         return exec_builtin(&words[1..], assigns, redirs);
     }
 
