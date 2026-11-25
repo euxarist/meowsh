@@ -35,7 +35,6 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .env("HOME", home.path())
         .env("TERM", "xterm")
-        .env("MEOWSH_ZLE", "1")
         .arg("-i")
         .stdin(tty(slave))
         .stdout(tty(slave))
@@ -109,4 +108,48 @@ fn send_string_bindings_are_read_as_input() {
     let rc = format!("bindkey -s '^Y' 'foo'\n{}", REPORT);
     let out = on_terminal(&rc, "\x19\x18");
     assert!(out.contains("[B=foo C=3]"), "output: {:?}", out);
+}
+
+#[test]
+fn inherited_fpath_is_preserved() {
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("FPATH", "/custom/zsh/funcs")
+        .args(["-f", "-c", "print -r -- \"$FPATH\""])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/custom/zsh/funcs\n");
+}
+
+#[test]
+fn bracketed_paste_magic_quotes_pasted_url() {
+    // Only runs when the host has zsh's contributed Zle functions installed.
+    let probe = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env_remove("FPATH")
+        .args([
+            "-f",
+            "-c",
+            "for d in $fpath; do [[ -e $d/url-quote-magic ]] && exit 0; done; exit 1",
+        ])
+        .status()
+        .unwrap();
+    if !probe.success() {
+        return;
+    }
+    let rc = format!(
+        "autoload -Uz bracketed-paste-magic url-quote-magic\n\
+         zle -N bracketed-paste bracketed-paste-magic\n\
+         zle -N self-insert url-quote-magic\n\
+         {}",
+        REPORT
+    );
+    let out = on_terminal(
+        &rc,
+        "yt-dlp \x1b[200~https://x.com/u/status/1?a=1&s=20\x1b[201~\x18",
+    );
+    assert!(
+        out.contains(r"[B=yt-dlp https://x.com/u/status/1\?a\=1\&s\=20 C=44]"),
+        "output: {:?}",
+        out
+    );
 }

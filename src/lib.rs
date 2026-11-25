@@ -8,7 +8,6 @@ pub mod history;
 pub mod jobs;
 pub mod lexer;
 pub mod lineedit;
-pub mod menu;
 pub mod modules;
 pub mod options;
 pub mod params;

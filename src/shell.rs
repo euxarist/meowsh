@@ -185,6 +185,13 @@ pub fn shell_init() {
     if let Some(p) = shell.param_mut("langinfo") {
         p.attrs |= crate::params::SPECIAL;
     }
+    // Populate FPATH from system zsh function directories when not inherited,
+    // matching zsh's default fpath so autoloadable functions (url-quote-magic,
+    // bracketed-paste-magic, compinit, ...) are found out of the box.
+    let fpath = default_fpath();
+    if !fpath.is_empty() {
+        set_default(&mut shell, "FPATH", fpath.join(":"), 0);
+    }
     // zsh has each pair from the start, empty unless inherited.
     for (scalar, array) in DEFAULT_TIES {
         shell.tie(scalar, array, ":");
@@ -196,6 +203,90 @@ pub fn shell_init() {
     }
     drop(shell);
     sync_lc_ctype();
+}
+
+/// Discovers standard zsh function directories on the host so `$fpath`
+/// matches a system zsh installation when `FPATH` is not inherited.
+fn default_fpath() -> Vec<String> {
+    use std::path::Path;
+
+    let mut dirs = Vec::new();
+    let mut push_if_dir = |p: &Path| {
+        if p.is_dir() {
+            if let Some(s) = p.to_str() {
+                if !dirs.iter().any(|d| d == s) {
+                    dirs.push(s.to_string());
+                }
+            }
+        }
+    };
+
+    for site in [
+        "/usr/local/share/zsh/site-functions",
+        "/opt/homebrew/share/zsh/site-functions",
+        "/usr/share/zsh/site-functions",
+        "/usr/share/zsh/vendor-functions",
+        "/usr/share/zsh/vendor-completions",
+    ] {
+        push_if_dir(Path::new(site));
+    }
+
+    // Collect a zsh functions tree (either flat or --enable-function-subdirs).
+    fn collect_func_tree(root: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        let mut subdirs = Vec::new();
+        let mut has_files = false;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                subdirs.push(p);
+            } else {
+                has_files = true;
+            }
+        }
+        subdirs.sort();
+        if has_files || subdirs.is_empty() {
+            if let Some(s) = root.to_str() {
+                if !out.iter().any(|d| d == s) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        for sub in subdirs {
+            collect_func_tree(&sub, out);
+        }
+    }
+
+    // Prefer an unversioned /usr/share/zsh/functions (Debian/Ubuntu/Arch),
+    // otherwise pick the newest versioned share/zsh/<ver>/functions tree.
+    let unversioned = Path::new("/usr/share/zsh/functions");
+    if unversioned.is_dir() {
+        collect_func_tree(unversioned, &mut dirs);
+    } else {
+        for base in [
+            "/opt/homebrew/share/zsh",
+            "/usr/local/share/zsh",
+            "/usr/share/zsh",
+        ] {
+            let Ok(entries) = std::fs::read_dir(base) else {
+                continue;
+            };
+            let mut versioned: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path().join("functions"))
+                .filter(|p| p.is_dir())
+                .collect();
+            versioned.sort();
+            if let Some(latest) = versioned.pop() {
+                collect_func_tree(&latest, &mut dirs);
+                break;
+            }
+        }
+    }
+
+    dirs
 }
 
 // Keeps an inherited $PWD only if it is absolute and names the current

@@ -14,8 +14,8 @@ use std::path::Path;
 pub struct Quals {
     pub null: bool,
     pub dots: bool,
-    // File-type and permission tests; each must pass.
-    tests: Vec<Test>,
+    // OR-separated groups (`,`) of AND-ed file-type/permission tests.
+    clauses: Vec<Vec<Test>>,
     sort: Option<(char, bool)>,
     sort_code: Option<(String, bool)>,
     // `:h`, `:t`, ... applied to each match.
@@ -32,6 +32,16 @@ pub struct Quals {
 }
 
 #[derive(Debug)]
+enum ModeCheck {
+    // All bits in mask are set (`+`).
+    AllSet(u32),
+    // No bits in mask are set (`-`).
+    NoneSet(u32),
+    // Masked bits equal expected (`=`).
+    Exact(u32, u32),
+}
+
+#[derive(Debug)]
 enum Test {
     Regular,
     Dir,
@@ -40,6 +50,9 @@ enum Test {
     Socket,
     Fifo,
     Perm(u32),
+    Mode(Vec<ModeCheck>),
+    Uid(u32),
+    Gid(u32),
     // Modified less (`-`) / more (`+`) / exactly than `n` units ago.
     Mtime(char, i64, u64),
     // `F`: a directory with something in it.
@@ -171,8 +184,95 @@ fn delimited_items(chars: &[(char, bool)], i: &mut usize) -> Result<String, Stri
     Err("missing end of string".to_string())
 }
 
+fn parse_mode_spec(spec: &str) -> Result<Vec<ModeCheck>, String> {
+    let mut checks = Vec::new();
+    for part in spec.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        let bytes = part.as_bytes();
+        // Octal form: `[+-]?[0-7]+`
+        let (sign, rest) = match bytes[0] {
+            b'+' => (Some('+'), &part[1..]),
+            b'-' => (Some('-'), &part[1..]),
+            b'=' => (Some('='), &part[1..]),
+            _ => (None, part),
+        };
+        if !rest.is_empty() && rest.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            let bits = u32::from_str_radix(rest, 8).map_err(|_| "invalid mode".to_string())?;
+            checks.push(match sign {
+                Some('+') => ModeCheck::AllSet(bits),
+                Some('-') => ModeCheck::NoneSet(bits),
+                _ => ModeCheck::Exact(0o7777, bits),
+            });
+            continue;
+        }
+        // Symbolic form: `[ugoa]*([+-=][rwxst]*)+`
+        let mut idx = 0;
+        let mut who_rwx = 0u32;
+        let mut who_spec = 0u32;
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'u' => {
+                    who_rwx |= 0o700;
+                    who_spec |= 0o4000;
+                }
+                b'g' => {
+                    who_rwx |= 0o070;
+                    who_spec |= 0o2000;
+                }
+                b'o' => {
+                    who_rwx |= 0o007;
+                    who_spec |= 0o1000;
+                }
+                b'a' => {
+                    who_rwx |= 0o777;
+                    who_spec |= 0o7000;
+                }
+                _ => break,
+            }
+            idx += 1;
+        }
+        if who_rwx == 0 && who_spec == 0 {
+            who_rwx = 0o777;
+            who_spec = 0o7000;
+        }
+        if idx >= bytes.len() {
+            return Err("invalid mode".to_string());
+        }
+        while idx < bytes.len() {
+            let op = bytes[idx];
+            if !matches!(op, b'+' | b'-' | b'=') {
+                return Err("invalid mode".to_string());
+            }
+            idx += 1;
+            let mut bits = 0u32;
+            while idx < bytes.len() && !matches!(bytes[idx], b'+' | b'-' | b'=') {
+                match bytes[idx] {
+                    b'r' => bits |= who_rwx & 0o444,
+                    b'w' => bits |= who_rwx & 0o222,
+                    b'x' => bits |= who_rwx & 0o111,
+                    b's' => bits |= who_spec & 0o6000,
+                    b't' => bits |= 0o1000,
+                    _ => return Err("invalid mode".to_string()),
+                }
+                idx += 1;
+            }
+            checks.push(match op {
+                b'+' => ModeCheck::AllSet(bits),
+                b'-' => ModeCheck::NoneSet(bits),
+                _ => ModeCheck::Exact(who_rwx, bits),
+            });
+        }
+    }
+    Ok(checks)
+}
+
 fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
-    let mut q = Quals::default();
+    let mut q = Quals {
+        clauses: vec![Vec::new()],
+        ..Default::default()
+    };
     let mut i = 0;
     let mut negate = false;
     while i < chars.len() {
@@ -194,6 +294,11 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
             }
             '^' => {
                 negate = !negate;
+                continue;
+            }
+            ',' => {
+                q.clauses.push(Vec::new());
+                negate = false;
                 continue;
             }
             'e' => {
@@ -328,8 +433,85 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
                 }
                 continue;
             }
+            'f' => {
+                let spec = match chars.get(i) {
+                    Some(&(ch, _)) if ch.is_ascii_digit() || ch == '+' || ch == '-' => {
+                        let start = i;
+                        if ch == '+' || ch == '-' {
+                            i += 1;
+                        }
+                        while chars.get(i).is_some_and(|&(d, _)| ('0'..='7').contains(&d)) {
+                            i += 1;
+                        }
+                        chars[start..i]
+                            .iter()
+                            .map(|&(ch, _)| ch)
+                            .collect::<String>()
+                    }
+                    _ => delimited_items(chars, &mut i)?,
+                };
+                Test::Mode(parse_mode_spec(&spec)?)
+            }
+            'u' => {
+                let uid = if chars.get(i).is_some_and(|&(d, _)| d.is_ascii_digit()) {
+                    let start = i;
+                    while chars.get(i).is_some_and(|&(d, _)| d.is_ascii_digit()) {
+                        i += 1;
+                    }
+                    chars[start..i]
+                        .iter()
+                        .map(|&(ch, _)| ch)
+                        .collect::<String>()
+                        .parse::<u32>()
+                        .map_err(|_| "invalid uid".to_string())?
+                } else {
+                    let name = delimited_items(chars, &mut i)?;
+                    if let Ok(n) = name.parse::<u32>() {
+                        n
+                    } else {
+                        let cstr =
+                            std::ffi::CString::new(name).map_err(|_| "unknown user".to_string())?;
+                        let pw = unsafe { libc::getpwnam(cstr.as_ptr()) };
+                        if pw.is_null() {
+                            return Err("unknown user".to_string());
+                        }
+                        unsafe { (*pw).pw_uid }
+                    }
+                };
+                Test::Uid(uid)
+            }
+            'g' => {
+                let gid = if chars.get(i).is_some_and(|&(d, _)| d.is_ascii_digit()) {
+                    let start = i;
+                    while chars.get(i).is_some_and(|&(d, _)| d.is_ascii_digit()) {
+                        i += 1;
+                    }
+                    chars[start..i]
+                        .iter()
+                        .map(|&(ch, _)| ch)
+                        .collect::<String>()
+                        .parse::<u32>()
+                        .map_err(|_| "invalid gid".to_string())?
+                } else {
+                    let name = delimited_items(chars, &mut i)?;
+                    if let Ok(n) = name.parse::<u32>() {
+                        n
+                    } else {
+                        let cstr = std::ffi::CString::new(name)
+                            .map_err(|_| "unknown group".to_string())?;
+                        let gr = unsafe { libc::getgrnam(cstr.as_ptr()) };
+                        if gr.is_null() {
+                            return Err("unknown group".to_string());
+                        }
+                        unsafe { (*gr).gr_gid }
+                    }
+                };
+                Test::Gid(gid)
+            }
+            'U' => Test::Uid(unsafe { libc::geteuid() }),
+            'G' => Test::Gid(unsafe { libc::getegid() }),
             // Accepted without effect.
-            '-' | ',' | 'L' | 'U' | 'G' | 's' | 'S' | 't' | 'T' => continue,
+            '-' | 'L' | 's' | 'S' | 't' | 'T' => continue,
             '0'..='9' | ']' => continue,
             other => return Err(format!("unknown file attribute: {}", other)),
         };
@@ -338,7 +520,7 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
         } else {
             test
         };
-        q.tests.push(test);
+        q.clauses.last_mut().unwrap().push(test);
     }
     Ok(q)
 }
@@ -382,6 +564,16 @@ fn passes(path: &Path, test: &Test) -> bool {
                 Test::Socket => (m.mode() as libc::mode_t) & libc::S_IFMT == libc::S_IFSOCK,
                 Test::Fifo => (m.mode() as libc::mode_t) & libc::S_IFMT == libc::S_IFIFO,
                 Test::Perm(bits) => m.permissions().mode() & bits != 0,
+                Test::Mode(checks) => {
+                    let mode = m.permissions().mode() & 0o7777;
+                    checks.iter().all(|c| match *c {
+                        ModeCheck::AllSet(bits) => (mode & bits) == bits,
+                        ModeCheck::NoneSet(bits) => (mode & bits) == 0,
+                        ModeCheck::Exact(mask, bits) => (mode & mask) == bits,
+                    })
+                }
+                Test::Uid(uid) => m.uid() == *uid,
+                Test::Gid(gid) => m.gid() == *gid,
                 Test::Full => {
                     m.is_dir() && fs::read_dir(path).is_ok_and(|mut d| d.next().is_some())
                 }
@@ -599,7 +791,13 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
         sort_names(&mut out);
         return out;
     };
-    out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
+    if !q.clauses.is_empty() {
+        out.retain(|p| {
+            q.clauses
+                .iter()
+                .any(|clause| clause.iter().all(|t| passes(Path::new(p), t)))
+        });
+    }
     append_slash(&mut out);
     sort_matches(&mut out, q);
     if !q.code.is_empty() {

@@ -165,33 +165,19 @@ and builtins include:
   module. Loading one meowsh does not have (zsh/compctl, zsh/zftp, ...)
   fails
 
-By default meowsh edits lines with its own editor, not zle: `zle`
-widgets and `bindkey` bindings are recorded but not used while typing,
-so zle plugins such as zsh-autosuggestions load but stay inactive
-(meowsh shows its own history suggestions). `compinit` runs zsh's
-function of that name when `$fpath` holds one and otherwise does nothing;
-`compdef` does nothing. `zcompile` builds, tests (`-t`), and loads
-`.zwc` wordcode dump files on `source` / `.`.
-
-A port of zsh's own line editor (zle: keymaps, widgets, vi mode, the
-`$BUFFER`/`$CURSOR` parameters) is in progress. Set `MEOWSH_ZLE=1` in the
-environment to use it instead; `+Z` or `unsetopt zle` then reads lines
-without editing, as in zsh. It queries the terminal as zsh does (`.term.*`
-parameters, OSC 133 prompt marks, cursor forms from `zle_cursorform`,
-OSC 52 for the `"+` and `"*` vi registers) and redraws with zsh's
-screen-update code. It does not yet have meowsh's suggestions,
-highlighting or Tab menu.
-zsh options meowsh does not implement are recorded by `setopt` but have
-no effect. Up and Down
-search history for lines starting with the typed text.
-
-Tab completes commands and file names with zsh's menu selection (what
-`zstyle ':completion:*' menu select` gives, as oh-my-zsh sets it): the
-first Tab inserts what the matches share and lists them in a grid below
-the line, the second starts selecting. Tab, Shift-Tab and the arrows move
-the selection, which is inserted as it moves; Enter keeps it, Ctrl-G puts
-back the word as typed, and typing anything else carries on from the
-selection. A grid taller than the terminal scrolls with the selection.
+meowsh edits lines with its port of zsh's line editor (zle: keymaps,
+widgets, vi mode, `$BUFFER`/`$CURSOR` parameters, completion modules,
+`region_highlight`, `POSTDISPLAY`). `+Z` or `unsetopt zle` reads lines
+without editing, as in zsh. It queries the terminal as zsh does
+(`.term.*` parameters, OSC 133 prompt marks, cursor forms from
+`zle_cursorform`, OSC 52 for the `"+` and `"*` vi registers) and redraws
+with zsh's screen-update code. Default `$fpath` includes the host's
+system zsh function directories when `FPATH` is not inherited, so
+autoloadable zsh functions (`compinit`, `url-quote-magic`,
+`bracketed-paste-magic`, ...) and zle plugins such as
+`zsh-autosuggestions` work directly. `zcompile` builds, tests (`-t`),
+and loads `.zwc` wordcode dump files on `source` / `.`. zsh options
+meowsh does not implement are recorded by `setopt` but have no effect.
 
 History is kept in
 `~/.meowsh_history`, in zsh's `EXTENDED_HISTORY` format: each line is
@@ -245,6 +231,3 @@ cargo build --release
 python3 scripts/ztst.py --zsh-src ../zsh            # summary per file
 python3 scripts/ztst.py --zsh-src ../zsh -v D04parameter  # show failures
 ```
-
-The script sets `MEOWSH_ZLE=1`, so the shells the tests start on a
-pseudo-terminal (the `X` and `Y` files) use the zle port.
