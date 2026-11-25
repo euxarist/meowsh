@@ -366,8 +366,6 @@ def run_file(meowsh, testdir, path, timeout, verbose):
     env["LANG"] = "C"
     env["TERM"] = "xterm-256color"
     env["SHELL"] = meowsh
-    # Interactive shells the tests start under zpty use meowsh's ZLE.
-    env["MEOWSH_ZLE"] = "1"
     env["HOME"] = os.path.join(testdir, "home.tmp")
     os.makedirs(env["HOME"], exist_ok=True)
     timed_out = False
@@ -512,7 +510,6 @@ def main():
                 env["LANG"] = "C"
                 env["TERM"] = "xterm-256color"
                 env["SHELL"] = zsh_bin
-                env["MEOWSH_ZLE"] = "1"
                 env["ZTST_testdir"] = testdir
                 env["ZTST_srcdir"] = testdir
                 env["ZTST_exe"] = zsh_bin

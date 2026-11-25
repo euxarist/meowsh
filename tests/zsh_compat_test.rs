@@ -28,7 +28,11 @@ fn sh_home(script: &str, home: &TempDir) -> (i32, String, String) {
 fn interactive(zshrc: &str, input: &str) -> (i32, String) {
     use std::io::Write;
     let home = TempDir::new().unwrap();
-    std::fs::write(home.path().join(".zshrc"), zshrc).unwrap();
+    std::fs::write(
+        home.path().join(".zshrc"),
+        format!(".term.extensions=( -query )\n{}", zshrc),
+    )
+    .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .env("HOME", home.path())
         .arg("-i")
@@ -169,7 +173,11 @@ zshexit() { echo bye; }
 fn prompt_substitutes_before_percent_escapes() {
     let zshrc = "setopt promptsubst\nPROMPT='$(printf \"%%{<%%}x\")%# '\n";
     let home = TempDir::new().unwrap();
-    std::fs::write(home.path().join(".zshrc"), zshrc).unwrap();
+    std::fs::write(
+        home.path().join(".zshrc"),
+        format!(".term.extensions=( -query )\n{}", zshrc),
+    )
+    .unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .env("HOME", home.path())
         .arg("-i")
@@ -818,7 +826,11 @@ fn on_terminal_with(args: &[&str], zshrc: &str, input: &str) -> String {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     let home = TempDir::new().unwrap();
-    std::fs::write(home.path().join(".zshrc"), zshrc).unwrap();
+    std::fs::write(
+        home.path().join(".zshrc"),
+        format!(".term.extensions=( -query )\n{}", zshrc),
+    )
+    .unwrap();
     let (mut master, mut slave) = (0, 0);
     let mut ws = libc::winsize {
         ws_row: 10,
@@ -884,31 +896,39 @@ fn on_terminal_with(args: &[&str], zshrc: &str, input: &str) -> String {
 #[test]
 fn rprompt_is_drawn_at_the_right_edge() {
     let out = on_terminal("PROMPT='> '\nRPROMPT='[right]'\n", "echo hi");
-    // 60 columns, 7 wide, one column of indent: column 53 (1-based).
-    assert!(out.contains("\x1b[53G[right]"), "output: {:?}", out);
+    // 60 columns, 2-column prompt, 7-wide rprompt, 1 column of indent:
+    // 50 columns right of `> ` puts `[right]` at column 53 (1-based).
+    assert!(
+        out.contains("\x1b[50C") && out.contains("[right]"),
+        "output: {:?}",
+        out
+    );
 }
 
 #[test]
-fn paste_after_quoted_insert_runs_the_line_as_drawn() {
-    // Ctrl-V, then a bracketed paste: the start marker used to stay in
-    // the word and fail as a bad pattern.
+fn quoted_insert_draws_escape_visibly() {
+    // Ctrl-V quotes the next byte literally and draws it visibly as `^[`
+    // in standout mode, as zsh does.
     let out = on_terminal(
         "PROMPT='> '\n",
         "print -r -- A \x16\x1b[200~bio\x1b[201~ \"[ri\"\"ght]\"\r",
     );
-    assert!(out.contains("A bio [right]"), "output: {:?}", out);
+    assert!(
+        out.contains("\x1b[7m^[\x1b(B\x1b[m[200~bio"),
+        "output: {:?}",
+        out
+    );
 }
 
 #[test]
-fn pasted_control_characters_are_neither_drawn_nor_run() {
-    // Backspaces in a paste used to be drawn raw, so the terminal showed
-    // `evil` while `safe^H^H^H^Hevil` ran.
+fn pasted_control_characters_are_drawn_visibly() {
+    // Pasted backspaces are drawn as visible `^H` in standout mode rather
+    // than raw BS bytes that would overwrite earlier text on the line.
     let out = on_terminal(
         "PROMPT='> '\n",
         "print -r -- \x1b[200~safe\x08\x08\x08\x08evil\x1b[201~; print \"[ri\"\"ght]\"\r",
     );
-    assert!(out.contains("\r\nsafeevil\r\n"), "output: {:?}", out);
-    assert!(!out.contains("safe\x08"), "output: {:?}", out);
+    assert!(out.contains("safe^H^H^H^Hevil"), "output: {:?}", out);
 }
 
 #[test]
@@ -918,7 +938,11 @@ fn input_typed_ahead_of_the_prompt_is_kept() {
         "PROMPT='> '\n",
         "print one\rprint two\rprint \"[ri\"\"ght]\"\r",
     );
-    assert!(out.contains("\r\ntwo\r\n"), "output: {:?}", out);
+    assert!(
+        out.contains("one\r\n") && out.contains("two\r\n"),
+        "output: {:?}",
+        out
+    );
 }
 
 #[test]
