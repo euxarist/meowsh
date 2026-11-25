@@ -2415,7 +2415,7 @@ fn run_command(
     }
     let name = words[0].clone();
 
-    if name == "exec" && !skip_functions {
+    if name == "exec" && !external_only {
         return exec_builtin(&words[1..], assigns, redirs);
     }
 

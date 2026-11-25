@@ -4202,15 +4202,15 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         // A nested expansion is quoted when the outer one is, so a split
         // in it keeps empty fields.
         val = braced(&body[i + 2..end - 1], mode)?;
-        // In double quotes a nested array joins unless it has its own (@)
-        // or (A).
+        // In double quotes a nested array joins unless it has its own (@),
+        // (A), or split flag (`Val::List(_, false)`).
         let inner_at = body.get(i + 2) == Some(&'(')
             && body[i + 3..end - 1]
                 .iter()
                 .take_while(|&&c| c != ')')
                 .any(|&c| c == '@' || c == 'A');
         if mode != Mode::Unquoted && !inner_at && body.get(end) == Some(&'[') {
-            if let Val::List(items, _) = &val {
+            if let Val::List(items, true) = &val {
                 val = Val::Str(items.join(&ifs_first()));
             }
         }
