@@ -6,6 +6,10 @@ use tempfile::TempDir;
 // Starts an interactive meowsh using ZLE with `zshrc`, types `input`
 // and returns everything it wrote.
 fn on_terminal(zshrc: &str, input: &str) -> String {
+    on_terminal_env(zshrc, input, &[])
+}
+
+fn on_terminal_env(zshrc: &str, input: &str, env: &[(&str, &std::path::Path)]) -> String {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     let home = TempDir::new().unwrap();
@@ -35,6 +39,7 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .env("HOME", home.path())
         .env("TERM", "xterm")
+        .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
         .arg("-i")
         .stdin(tty(slave))
         .stdout(tty(slave))
@@ -216,4 +221,72 @@ bindkey '^A' push
     let out = on_terminal(rc, "echo \x01\r");
     assert!(!out.contains("too many arguments"), "output: {:?}", out);
     assert!(out.contains("-x y"), "output: {:?}", out);
+}
+
+// A compiled terminfo entry (term(5), legacy format) with only
+// `colors` and foot's `setaf`.
+fn terminfo_entry(name: &str, colours: i16) -> Vec<u8> {
+    let setaf = "\x1b[%?%p1%'\x08'%<%t3%p1%d%e%p1%'\x10'%<%t9%p1%'\x08'%-%d%e38:5:%p1%d%;m\0";
+    let (nums, strs) = (14i16, 361i16);
+    let mut e = Vec::new();
+    for h in [
+        0o432,
+        name.len() as i16 + 1,
+        0,
+        nums,
+        strs,
+        setaf.len() as i16,
+    ] {
+        e.extend_from_slice(&h.to_le_bytes());
+    }
+    e.extend_from_slice(name.as_bytes());
+    e.push(0);
+    if e.len() % 2 == 1 {
+        e.push(0);
+    }
+    for i in 0..nums {
+        e.extend_from_slice(&(if i == 13 { colours } else { -1 }).to_le_bytes());
+    }
+    for i in 0..strs {
+        e.extend_from_slice(&(if i == 359 { 0i16 } else { -1 }).to_le_bytes());
+    }
+    e.extend_from_slice(setaf.as_bytes());
+    e
+}
+
+#[test]
+fn highlight_colours_come_from_terminfo() {
+    // zsh-autosuggestions greys its suggestion with fg=8, which zsh only
+    // draws when terminfo gives the terminal more than 8 colours.
+    let ti = TempDir::new().unwrap();
+    std::fs::create_dir(ti.path().join("m")).unwrap();
+    std::fs::write(
+        ti.path().join("m/meowterm"),
+        terminfo_entry("meowterm", 256),
+    )
+    .unwrap();
+    let rc = r#"
+show() {
+    POSTDISPLAY="GHOST"
+    region_highlight=("P${#BUFFER} $(( ${#BUFFER} + 5 )) fg=8")
+    zle -R
+    print -r "[B=$BUFFER]"
+    BUFFER=
+    zle accept-line
+}
+zle -N show
+bindkey '^A' show
+"#;
+    let out = on_terminal_env(
+        rc,
+        "ec\x01",
+        &[
+            ("TERMINFO", ti.path()),
+            ("TERM", std::path::Path::new("meowterm")),
+        ],
+    );
+    let marker = out
+        .find("[B=ec]")
+        .unwrap_or_else(|| panic!("output: {:?}", out));
+    assert!(out[..marker].contains("\x1b[90mGHOST"), "output: {:?}", out);
 }
