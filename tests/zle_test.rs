@@ -179,3 +179,26 @@ bindkey '^A' start_async
     let out = on_terminal(rc, "ec\x01");
     assert!(out.contains("[B=ec P=suggestion]"), "output: {:?}", out);
 }
+
+#[test]
+fn zle_r_draws_postdisplay_set_in_the_same_widget() {
+    // zsh-autosuggestions sets POSTDISPLAY from a zle -F handler and calls
+    // zle -R; no widget returns before the redraw.
+    let rc = r#"
+show() {
+    POSTDISPLAY="GHOSTTEXT"
+    zle -R
+    POSTDISPLAY=
+    print -r "[B=$BUFFER]"
+    BUFFER=
+    zle accept-line
+}
+zle -N show
+bindkey '^A' show
+"#;
+    let out = on_terminal(rc, "ec\x01");
+    let marker = out
+        .find("[B=ec]")
+        .unwrap_or_else(|| panic!("output: {:?}", out));
+    assert!(out[..marker].contains("GHOSTTEXT"), "output: {:?}", out);
+}
