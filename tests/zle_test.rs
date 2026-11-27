@@ -202,3 +202,18 @@ bindkey '^A' show
         .unwrap_or_else(|| panic!("output: {:?}", out));
     assert!(out[..marker].contains("GHOSTTEXT"), "output: {:?}", out);
 }
+
+#[test]
+fn zle_u_accepts_a_lone_dash_before_the_string() {
+    // bracketed-paste-magic runs `zle -U - "$PASTED"`; zsh drops the `-`.
+    let rc = r#"
+push() {
+    zle -U - "-x y"
+}
+zle -N push
+bindkey '^A' push
+"#;
+    let out = on_terminal(rc, "echo \x01\r");
+    assert!(!out.contains("too many arguments"), "output: {:?}", out);
+    assert!(out.contains("-x y"), "output: {:?}", out);
+}
