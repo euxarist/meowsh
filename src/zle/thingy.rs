@@ -153,11 +153,12 @@ pub fn builtin_zle(words: &[String]) -> i32 {
     let mut i = 1;
     while i < words.len() {
         let w = &words[i];
-        if w == "--" {
+        // zsh's option parser takes a lone `-` as the end of options too.
+        if w == "--" || w == "-" {
             i += 1;
             break;
         }
-        if w == "-" || !w.starts_with('-') {
+        if !w.starts_with('-') {
             break;
         }
         for c in w[1..].chars() {
