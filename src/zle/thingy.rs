@@ -290,6 +290,9 @@ pub fn builtin_zle(words: &[String]) -> i32 {
             }
             let c = isset('c');
             with_active(|z| {
+                // The widget may have set $POSTDISPLAY or $region_highlight
+                // since entry; zsh's specials write through, so draw those.
+                params::pull(z);
                 let saved = z.statusline.take();
                 let ocl = z.clearlist;
                 if let Some(first) = args.first() {
