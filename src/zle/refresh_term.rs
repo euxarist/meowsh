@@ -1,8 +1,9 @@
 //! Terminal capabilities for the display code: zsh's tcstr/tclen table
 //! (init.c's init_term) with tcout(), tcoutarg(), tcmultout() and
-//! tsetcap(). meowsh has no terminfo, so the strings are fixed xterm and
+//! tsetcap(). meowsh has no curses, so the strings are fixed xterm and
 //! vt100 descriptions, kept as terminfo has them (padding included, since
-//! zsh compares their lengths when choosing motions).
+//! zsh compares their lengths when choosing motions). Only the colour
+//! capabilities are read from the terminal's terminfo entry.
 
 use super::write_bytes;
 use crate::zle::termctl;
@@ -183,6 +184,13 @@ fn build(name: &str) -> Term {
             .find_map(|tb| tb.iter().find(|(n, _)| n == cap))
             .map(|(_, v)| v.to_string());
     }
+    // zsh takes colours from terminfo; the tables only guess them from
+    // the name, which leaves terminals like foot at 8 colours.
+    if let Some(ti) = read_terminfo(name) {
+        t.colours = ti.colours;
+        t.caps[TCFGCOLOUR] = ti.setaf;
+        t.caps[TCBGCOLOUR] = ti.setab;
+    }
     // init_term's fixups.
     if t.caps[TCUP].is_none() {
         t.flags |= TERM_NOUP;
@@ -215,6 +223,105 @@ fn build(name: &str) -> Term {
         }
     }
     t
+}
+
+/// The colour capabilities of a compiled terminfo entry.
+struct TermInfoColours {
+    colours: i32,
+    setaf: Option<String>,
+    setab: Option<String>,
+}
+
+/// Finds `name` in the terminfo database as ncurses searches it.
+fn terminfo_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let first = name.chars().next()?;
+    if name.contains('/') {
+        return None;
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("TERMINFO") {
+        dirs.push(d.into());
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(h).join(".terminfo"));
+    }
+    let system = ["/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo"];
+    match std::env::var("TERMINFO_DIRS") {
+        Ok(list) => {
+            for d in list.split(':') {
+                if d.is_empty() {
+                    dirs.extend(system.iter().map(PathBuf::from));
+                } else {
+                    dirs.push(d.into());
+                }
+            }
+        }
+        Err(_) => dirs.extend(system.iter().map(PathBuf::from)),
+    }
+    dirs.push("/usr/lib/terminfo".into());
+    dirs.into_iter().find_map(|d| {
+        [first.to_string(), format!("{:02x}", first as u32)]
+            .into_iter()
+            .map(|sub| d.join(sub).join(name))
+            .find(|p| p.is_file())
+    })
+}
+
+/// Reads `colors`, `setaf` and `setab` from a compiled terminfo entry
+/// (term(5): the legacy format and the 32-bit-number one).
+fn read_terminfo(name: &str) -> Option<TermInfoColours> {
+    const COLORS: usize = 13;
+    const SETAF: usize = 359;
+    const SETAB: usize = 360;
+    let data = std::fs::read(terminfo_path(name)?).ok()?;
+    let short = |i: usize| -> Option<i32> {
+        let b = data.get(i..i + 2)?;
+        Some(i16::from_le_bytes([b[0], b[1]]) as i32)
+    };
+    let num_size = match short(0)? {
+        0o432 => 2,
+        0o1036 => 4,
+        _ => return None,
+    };
+    let [names, bools, nums, strs] = [1, 2, 3, 4].map(|k| short(k * 2).unwrap_or(-1));
+    if [names, bools, nums, strs].iter().any(|&n| n < 0) {
+        return None;
+    }
+    let (names, bools, nums, strs) = (names as usize, bools as usize, nums as usize, strs as usize);
+    let mut off = 12 + names + bools;
+    off += off % 2;
+    let nums_at = off;
+    let strs_at = nums_at + nums * num_size;
+    let table_at = strs_at + strs * 2;
+    let colours = if COLORS < nums {
+        let at = nums_at + COLORS * num_size;
+        let b = data.get(at..at + num_size)?;
+        if num_size == 2 {
+            i16::from_le_bytes([b[0], b[1]]) as i32
+        } else {
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        }
+    } else {
+        -1
+    };
+    let string = |idx: usize| -> Option<String> {
+        if idx >= strs {
+            return None;
+        }
+        let o = short(strs_at + idx * 2)?;
+        if o < 0 {
+            return None;
+        }
+        let s = data.get(table_at + o as usize..)?;
+        let end = s.iter().position(|&c| c == 0)?;
+        Some(String::from_utf8_lossy(&s[..end]).into_owned())
+    };
+    Some(TermInfoColours {
+        colours,
+        setaf: string(SETAF),
+        setab: string(SETAB),
+    })
 }
 
 /// Rereads the description when $TERM has changed (zsh reinitialises
@@ -342,6 +449,10 @@ fn tparm(fmt: &str, arg: i32) -> String {
             b'i' => {
                 params[0] += 1;
                 params[1] += 1;
+            }
+            b'\'' => {
+                stack.push(b.get(i).copied().unwrap_or(0) as i32);
+                i += 2;
             }
             b'{' => {
                 let mut n = 0i32;
