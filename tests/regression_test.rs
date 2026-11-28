@@ -700,6 +700,10 @@ fn autoload_x_outside_a_function_is_refused() {
     assert_eq!(o.signal, None);
     assert_eq!(o.status, Some(1));
     assert!(o.stderr.contains("bad option(s)"), "{}", o.stderr);
+    // Under -c zsh words it differently.
+    let o = zsh("autoload -X");
+    assert_eq!(o.status, Some(1));
+    assert!(o.stderr.contains("bad autoload"), "{}", o.stderr);
 }
 
 #[test]
@@ -743,13 +747,13 @@ fn empty_pattern_replaces_before_each_character_only() {
 fn brace_range_of_non_ascii_letters() {
     let o = zsh("LC_ALL=en_US.UTF-8; print {é..ë}");
     assert_eq!(o.stdout, "é ê ë\n");
+    // With single-byte characters it is not a range of two characters.
+    let o = zsh("LC_ALL=C; print {é..ë} {a..c}");
+    assert_eq!(o.stdout, "{é..ë} a b c\n");
 }
 
 #[test]
 fn tilde_number_names_a_directory_stack_entry() {
-    // With single-byte characters it is not a range of two characters.
-    let o = zsh("LC_ALL=C; print {é..ë} {a..c}");
-    assert_eq!(o.stdout, "{é..ë} a b c\n");
     let o = zsh("cd /tmp; pushd /usr >/dev/null; pushd /etc >/dev/null; \
          print ~0 ~1 ~2 ~+1 ~-0 ~-1 ~1/x; print ~9");
     assert_eq!(o.stdout, "/etc /usr /tmp /usr /tmp /usr /usr/x\n");

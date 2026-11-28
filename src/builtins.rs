@@ -4214,8 +4214,20 @@ fn builtin_autoload(words: &[String]) -> i32 {
     let args = &words[i..];
     if exec_now {
         // -X replaces the function that is running: there must be one.
+        // zsh refuses it as an option where there is no script name (the
+        // top of a script or of standard input) and as an autoload
+        // elsewhere outside a function (`-c`, a sourced file).
         if with_shell(|s| s.func_depth) == 0 {
-            builtin_err("autoload", "bad option(s)");
+            let unnamed = with_shell(|s| s.source_depth) == 0
+                && crate::shell::eval_context().first().map(String::as_str) == Some("toplevel");
+            builtin_err(
+                "autoload",
+                if unnamed {
+                    "bad option(s)"
+                } else {
+                    "bad autoload"
+                },
+            );
             return 1;
         }
         return autoload_exec(args.first().map(|s| s.as_str()), default_too, ksh_style);
