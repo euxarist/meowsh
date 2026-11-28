@@ -741,12 +741,15 @@ fn empty_pattern_replaces_before_each_character_only() {
 
 #[test]
 fn brace_range_of_non_ascii_letters() {
-    let o = zsh("print {é..ë}");
+    let o = zsh("LC_ALL=en_US.UTF-8; print {é..ë}");
     assert_eq!(o.stdout, "é ê ë\n");
 }
 
 #[test]
 fn tilde_number_names_a_directory_stack_entry() {
+    // With single-byte characters it is not a range of two characters.
+    let o = zsh("LC_ALL=C; print {é..ë} {a..c}");
+    assert_eq!(o.stdout, "{é..ë} a b c\n");
     let o = zsh("cd /tmp; pushd /usr >/dev/null; pushd /etc >/dev/null; \
          print ~0 ~1 ~2 ~+1 ~-0 ~-1 ~1/x; print ~9");
     assert_eq!(o.stdout, "/etc /usr /tmp /usr /tmp /usr /usr/x\n");

@@ -5844,6 +5844,11 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
             let raw = [ca[0], cb[0]]
                 .iter()
                 .any(|&c| crate::shell::decode_raw_byte(c).is_some());
+            // Where characters are single bytes a multibyte letter is not
+            // one character, so there is no range: the braces stay.
+            if !raw && [ca[0], cb[0]].iter().any(|c| !c.is_ascii()) && crate::shell::is_c_locale() {
+                return None;
+            }
             let (mut a, mut b) = (to_ord(ca[0]), to_ord(cb[0]));
             let rev = b < a;
             if rev {
