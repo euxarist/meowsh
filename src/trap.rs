@@ -351,16 +351,7 @@ pub fn run_exit_trap() {
     if let Some(a) = action {
         if !a.is_empty() {
             with_shell(|s| s.flow = Flow::None);
-            // The shell is past its top level: $zsh_eval_context is
-            // just `trap`, as in zsh.
-            let outer = crate::shell::EVAL_CONTEXT
-                .lock()
-                .map(|mut c| std::mem::take(&mut *c))
-                .unwrap_or_default();
             run_action(&a);
-            if let Ok(mut c) = crate::shell::EVAL_CONTEXT.lock() {
-                *c = outer;
-            }
         }
     }
 }

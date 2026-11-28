@@ -529,9 +529,22 @@ fn return_outside_a_function_leaves_the_shell() {
 }
 
 #[test]
-fn exit_trap_runs_in_trap_context_alone() {
-    let o = zsh("trap 'print $ZSH_EVAL_CONTEXT' EXIT");
-    assert_eq!(o.stdout, "trap\n");
+fn exit_trap_context_names_where_the_shell_ended() {
+    let trap = "trap 'print $ZSH_EVAL_CONTEXT' EXIT";
+    // -c keeps its frame whether the string runs out or calls exit.
+    assert_eq!(zsh(trap).stdout, "cmdarg:trap\n");
+    assert_eq!(zsh(&format!("{}; exit", trap)).stdout, "cmdarg:trap\n");
+    let tmp = TempDir::new().unwrap();
+    let script = |body: &str| {
+        let path = tmp.path().join("s");
+        std::fs::write(&path, body).unwrap();
+        run_mode(false, &[path.to_str().unwrap()], "", None).stdout
+    };
+    // A script that runs out has left the top level; one that exits has not.
+    assert_eq!(script(&format!("{}\n", trap)), "trap\n");
+    assert_eq!(script(&format!("{}\nexit\n", trap)), "toplevel:trap\n");
+    // Standard input behaves like a script.
+    assert_eq!(run_mode(false, &[], trap, None).stdout, "trap\n");
 }
 
 #[test]

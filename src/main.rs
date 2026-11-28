@@ -293,6 +293,15 @@ fn main() {
     } else {
         run_fd(0, false)
     };
+    // Input that simply ran out (a script or standard input, not `-c`)
+    // has left the top level: the EXIT trap then sees $zsh_eval_context
+    // as just `trap`. An `exit`, or any error that ends the shell, keeps
+    // the frame it happened in.
+    if flow() == Flow::None && args.command.is_none() {
+        if let Ok(mut c) = meowsh::shell::EVAL_CONTEXT.lock() {
+            c.clear();
+        }
+    }
     let status = match flow() {
         Flow::Exit(n) => n,
         Flow::None => status,
