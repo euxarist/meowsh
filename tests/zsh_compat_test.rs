@@ -875,8 +875,23 @@ fn on_terminal_with(args: &[&str], zshrc: &str, input: &str) -> String {
             out.extend_from_slice(&buf[..n]);
         }
     };
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    drain(&mut m, &mut out);
+    // Wait for the line editor to take over the terminal (it turns on
+    // bracketed paste once it has). Input sent while the terminal is
+    // still in cooked mode goes through the kernel's line discipline,
+    // which swallows a Ctrl-V; a slow machine needs more than a fixed
+    // pause to get there.
+    let started = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drain(&mut m, &mut out);
+        let waited = started.elapsed();
+        let ready = out.windows(8).any(|w| w == b"\x1b[?2004h");
+        if (ready && waited >= std::time::Duration::from_millis(300))
+            || waited >= std::time::Duration::from_secs(5)
+        {
+            break;
+        }
+    }
     m.write_all(input.as_bytes()).unwrap();
     let sent = std::time::Instant::now();
     while sent.elapsed() < std::time::Duration::from_secs(2) {
