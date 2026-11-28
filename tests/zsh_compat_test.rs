@@ -311,7 +311,7 @@ fn read_keys_and_yes_no() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .args([
             "-c",
-            "read -q && echo yes; read -k 1 c; echo \"[$c]\"; read -k 2; echo \"[$REPLY]\"",
+            "read -u0 -q && echo yes; read -u0 -k 1 c; echo \"[$c]\"; read -u0 -k 2; echo \"[$REPLY]\"",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -875,8 +875,23 @@ fn on_terminal_with(args: &[&str], zshrc: &str, input: &str) -> String {
             out.extend_from_slice(&buf[..n]);
         }
     };
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    drain(&mut m, &mut out);
+    // Wait for the line editor to take over the terminal (it turns on
+    // bracketed paste once it has). Input sent while the terminal is
+    // still in cooked mode goes through the kernel's line discipline,
+    // which swallows a Ctrl-V; a slow machine needs more than a fixed
+    // pause to get there.
+    let started = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drain(&mut m, &mut out);
+        let waited = started.elapsed();
+        let ready = out.windows(8).any(|w| w == b"\x1b[?2004h");
+        if (ready && waited >= std::time::Duration::from_millis(300))
+            || waited >= std::time::Duration::from_secs(5)
+        {
+            break;
+        }
+    }
     m.write_all(input.as_bytes()).unwrap();
     let sent = std::time::Instant::now();
     while sent.elapsed() < std::time::Duration::from_secs(2) {
@@ -2273,4 +2288,20 @@ print -r -- "${history[(r)echo*]}"
     assert_eq!(st, 0, "out={:?} err={:?}", out, err);
     assert_eq!(out, "echo item-12\n");
     assert!(err.is_empty(), "err={:?}", err);
+}
+
+#[test]
+fn completion_function_changes_to_prefix_are_undone_on_return() {
+    // zsh restores PREFIX, SUFFIX and the like when a function called
+    // during completion returns. Without that, a second matcher-list
+    // attempt starts from what the first one left and replaces the word.
+    let out = on_terminal(
+        "PROMPT='> '\n\
+         inner() { PREFIX=changed }\n\
+         comp() { inner; compadd -U -- \"got:$PREFIX\" }\n\
+         zle -C mycomp complete-word comp\n\
+         bindkey '^T' mycomp\n",
+        "echo foo\x14 \"[ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("got:foo [right]"), "output: {:?}", out);
 }

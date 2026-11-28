@@ -202,6 +202,8 @@ fn main() {
         // As in zsh, an interactive shell on a terminal uses the line
         // editor unless `+Z` (or `-o nozle`) says otherwise.
         options::set_in(s, "zle", interactive && tty_in);
+        // HASH_DIRS starts in the same state as INTERACTIVE.
+        options::set_in(s, "hashdirs", interactive);
         for (opt, on) in &args.options {
             options::set_in(s, opt, *on);
         }
@@ -209,6 +211,17 @@ fn main() {
         // $ZSH_ARGZERO: $0 as the shell started.
         let a0 = args.script.clone().unwrap_or_else(|| s.argv0.clone());
         s.store("ZSH_ARGZERO", meowsh::params::Value::Scalar(a0));
+        // $ZSH_SCRIPT: the script being run, unset for -c and stdin.
+        if let Some(script) = &args.script {
+            s.store("ZSH_SCRIPT", meowsh::params::Value::Scalar(script.clone()));
+        }
+        // $ZSH_NAME: what the shell was invoked as.
+        let invoked = argv.first().map(|a| a.as_str()).unwrap_or("meowsh");
+        let invoked = invoked.rsplit('/').next().unwrap_or(invoked);
+        s.store(
+            "ZSH_NAME",
+            meowsh::params::Value::Scalar(invoked.trim_start_matches('-').to_string()),
+        );
         if let Ok(mut c) = meowsh::shell::EVAL_CONTEXT.lock() {
             c.push(if args.command.is_some() {
                 "cmdarg"
@@ -280,6 +293,15 @@ fn main() {
     } else {
         run_fd(0, false)
     };
+    // Input that simply ran out (a script or standard input, not `-c`)
+    // has left the top level: the EXIT trap then sees $zsh_eval_context
+    // as just `trap`. An `exit`, or any error that ends the shell, keeps
+    // the frame it happened in.
+    if flow() == Flow::None && args.command.is_none() {
+        if let Ok(mut c) = meowsh::shell::EVAL_CONTEXT.lock() {
+            c.clear();
+        }
+    }
     let status = match flow() {
         Flow::Exit(n) => n,
         Flow::None => status,

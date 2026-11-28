@@ -53,8 +53,17 @@ enum Test {
     Mode(Vec<ModeCheck>),
     Uid(u32),
     Gid(u32),
-    // Modified less (`-`) / more (`+`) / exactly than `n` units ago.
-    Mtime(char, i64, u64),
+    // Modified (`m`), accessed (`a`) or changed (`c`) less (`-`) / more
+    // (`+`) / exactly than `n` units ago.
+    Time(char, char, i64, u64),
+    // `L`: size under (`-`) / over (`+`) / exactly `n` units of 2^shift bytes.
+    Size(char, u64, u32),
+    // `l`: link count.
+    Nlink(char, u64),
+    // `%`, `%b`, `%c`: a device file.
+    Device(char),
+    // `-`: the test looks at what a symbolic link points to.
+    Follow(Box<Test>),
     // `F`: a directory with something in it.
     Full,
     Negate(Box<Test>),
@@ -275,6 +284,7 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
     };
     let mut i = 0;
     let mut negate = false;
+    let mut follow = false;
     while i < chars.len() {
         let (c, _) = chars[i];
         i += 1;
@@ -299,6 +309,7 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
             ',' => {
                 q.clauses.push(Vec::new());
                 negate = false;
+                follow = false;
                 continue;
             }
             'e' => {
@@ -370,7 +381,54 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
             'R' => Test::Perm(0o004),
             'W' => Test::Perm(0o002),
             'X' => Test::Perm(0o001),
-            'm' => {
+            's' => Test::Perm(0o4000),
+            'S' => Test::Perm(0o2000),
+            't' => Test::Perm(0o1000),
+            '%' => match chars.get(i) {
+                Some(&(k @ ('b' | 'c'), _)) => {
+                    i += 1;
+                    Test::Device(k)
+                }
+                _ => Test::Device('%'),
+            },
+            'L' | 'l' => {
+                let shift = match chars.get(i) {
+                    Some(&(u, _)) if c == 'L' && "pPkKmMgGtT".contains(u) => {
+                        i += 1;
+                        match u.to_ascii_lowercase() {
+                            'p' => 9,
+                            'k' => 10,
+                            'm' => 20,
+                            'g' => 30,
+                            _ => 40,
+                        }
+                    }
+                    _ => 0,
+                };
+                let sign = match chars.get(i) {
+                    Some(&(s @ ('+' | '-'), _)) => {
+                        i += 1;
+                        s
+                    }
+                    _ => '=',
+                };
+                let start = i;
+                while chars.get(i).is_some_and(|&(c, _)| c.is_ascii_digit()) {
+                    i += 1;
+                }
+                let n: u64 = chars[start..i]
+                    .iter()
+                    .map(|&(c, _)| c)
+                    .collect::<String>()
+                    .parse()
+                    .map_err(|_| "number expected".to_string())?;
+                if c == 'L' {
+                    Test::Size(sign, n, shift)
+                } else {
+                    Test::Nlink(sign, n)
+                }
+            }
+            'm' | 'a' | 'c' => {
                 let unit = match chars.get(i) {
                     Some(&(u @ ('M' | 'w' | 'h' | 'm' | 's'), _)) => {
                         i += 1;
@@ -403,7 +461,7 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
                     's' => 1,
                     _ => 86400,
                 };
-                Test::Mtime(sign, n, secs)
+                Test::Time(c, sign, n, secs)
             }
             'o' | 'O' => {
                 let &(key, _) = chars
@@ -510,10 +568,19 @@ fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
             }
             'U' => Test::Uid(unsafe { libc::geteuid() }),
             'G' => Test::Gid(unsafe { libc::getegid() }),
+            '-' => {
+                follow = !follow;
+                continue;
+            }
             // Accepted without effect.
-            '-' | 'L' | 's' | 'S' | 't' | 'T' => continue,
+            'T' => continue,
             '0'..='9' | ']' => continue,
             other => return Err(format!("unknown file attribute: {}", other)),
+        };
+        let test = if follow {
+            Test::Follow(Box::new(test))
+        } else {
+            test
         };
         let test = if negate {
             Test::Negate(Box::new(test))
@@ -550,14 +617,42 @@ fn run_code(code: &str, path: &str) -> Option<Vec<String>> {
 }
 
 fn passes(path: &Path, test: &Test) -> bool {
+    passes_as(path, test, false)
+}
+
+// As zsh does, a test sees the link itself unless `-` came before it;
+// then it sees the target, or the link again when that is missing.
+fn passes_as(path: &Path, test: &Test, follow: bool) -> bool {
     match test {
-        Test::Negate(t) => !passes(path, t),
-        Test::Link => fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()),
+        Test::Negate(t) => !passes_as(path, t, follow),
+        Test::Follow(t) => passes_as(path, t, true),
         t => {
-            let Ok(m) = fs::metadata(path) else {
+            let stat = if follow {
+                fs::metadata(path).or_else(|_| fs::symlink_metadata(path))
+            } else {
+                fs::symlink_metadata(path)
+            };
+            let Ok(m) = stat else {
                 return false;
             };
+            let cmp = |sign: char, have: u64, want: u64| match sign {
+                '-' => have < want,
+                '+' => have > want,
+                _ => have == want,
+            };
+            let fmt = (m.mode() as libc::mode_t) & libc::S_IFMT;
             match t {
+                Test::Link => m.file_type().is_symlink(),
+                Test::Size(sign, n, shift) => {
+                    let units = (m.len() + (1u64 << shift) - 1) >> shift;
+                    cmp(*sign, units, *n)
+                }
+                Test::Nlink(sign, n) => cmp(*sign, m.nlink(), *n),
+                Test::Device(kind) => match kind {
+                    'b' => fmt == libc::S_IFBLK,
+                    'c' => fmt == libc::S_IFCHR,
+                    _ => fmt == libc::S_IFBLK || fmt == libc::S_IFCHR,
+                },
                 Test::Regular => m.is_file(),
                 Test::Dir => m.is_dir(),
                 Test::Exec => m.is_file() && m.permissions().mode() & 0o111 != 0,
@@ -577,19 +672,24 @@ fn passes(path: &Path, test: &Test) -> bool {
                 Test::Full => {
                     m.is_dir() && fs::read_dir(path).is_ok_and(|mut d| d.next().is_some())
                 }
-                Test::Mtime(sign, n, secs) => {
+                Test::Time(which, sign, n, secs) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    let age = (now - m.mtime()).max(0) / *secs as i64;
+                    let stamp = match which {
+                        'a' => m.atime(),
+                        'c' => m.ctime(),
+                        _ => m.mtime(),
+                    };
+                    let age = (now - stamp).max(0) / *secs as i64;
                     match sign {
                         '-' => age < *n,
                         '+' => age > *n,
                         _ => age == *n,
                     }
                 }
-                Test::Link | Test::Negate(_) => unreachable!(),
+                Test::Negate(_) | Test::Follow(_) => unreachable!(),
             }
         }
     }
@@ -672,7 +772,9 @@ fn sort_matches(out: &mut Vec<String>, q: &Quals) {
                 s.remove_param("REPLY");
             }),
         }
-        keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        keyed.sort_by(|a, b| {
+            crate::shell::collate(&a.0, &b.0).then_with(|| crate::shell::collate(&a.1, &b.1))
+        });
         if *rev {
             keyed.reverse();
         }
@@ -686,7 +788,7 @@ fn sort_matches(out: &mut Vec<String>, q: &Quals) {
                     std::cmp::Reverse(fs::metadata(p).map(|m| m.mtime()).unwrap_or(0))
                 }),
                 'L' => out.sort_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)),
-                _ => out.sort(),
+                _ => out.sort_by(|a, b| crate::shell::collate(a, b)),
             }
             if rev {
                 out.reverse();
@@ -701,7 +803,7 @@ fn sort_names(out: &mut Vec<String>) {
     if crate::options::is_set("numericglobsort") {
         out.sort_by(|a, b| crate::expand::numeric_order(a, b));
     } else {
-        out.sort();
+        out.sort_by(|a, b| crate::shell::collate(a, b));
     }
     out.dedup();
 }
@@ -861,7 +963,7 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
             if crate::options::is_set("numericglobsort") {
                 out.sort_by(|a, b| crate::expand::numeric_order(a, b));
             } else {
-                out.sort();
+                out.sort_by(|a, b| crate::shell::collate(a, b));
             }
             if q.sort.is_some_and(|(_, rev)| rev) {
                 out.reverse();

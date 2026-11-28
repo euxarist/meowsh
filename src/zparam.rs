@@ -22,6 +22,7 @@ const NAMES: &[&str] = &[
     "errnos",
     "epochtime",
     "functions_source",
+    "patchars",
 ];
 
 /// Brings special parameter `name` up to date, if it is one.
@@ -121,6 +122,15 @@ pub fn ensure(name: &str) {
             )
         }
         "errnos" => Value::Array(crate::zsystem::errnos()),
+        // The pattern characters `disable -p` can turn off.
+        "patchars" => Value::Array(
+            [
+                "|", "~", "(", "?", "*", "[", "<", "^", "#", "?(", "*(", "+(", "!(", "!(", "@(",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        ),
         "functions_source" => assoc(
             with_shell(|s| {
                 s.functions

@@ -413,6 +413,18 @@ impl Deparser {
 /// zsh's `functions name` output.
 pub fn function_text(name: &str, body: &Node, spaces: Option<usize>) -> String {
     let mut s = Deparser::new(spaces).function(name, body);
+    // A function still to be autoloaded is marked, as zsh marks it.
+    if Deparser::new(None)
+        .body_text(body)
+        .trim_start_matches(['{', ' ', '\n', '\t'])
+        .starts_with("builtin autoload -X")
+    {
+        let indent = match spaces {
+            Some(n) => " ".repeat(n),
+            None => "\t".to_string(),
+        };
+        s = s.replacen(" () {", &format!(" () {{\n{}# undefined", indent), 1);
+    }
     // Traced functions say so first, as zsh shows them.
     if crate::shell::trace_kind(name).is_some() {
         let indent = match spaces {

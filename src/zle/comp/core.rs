@@ -2313,6 +2313,8 @@ pub fn addexpl(z: &mut Zle, always: bool) {
 
 // strcoll(3), as zsh sorts with it.
 fn strcoll(a: &[u8], b: &[u8]) -> i32 {
+    // The locale may have changed since the last comparison.
+    crate::shell::sync_lc_collate();
     match (std::ffi::CString::new(a), std::ffi::CString::new(b)) {
         (Ok(x), Ok(y)) => {
             // SAFETY: both are valid NUL-terminated strings.

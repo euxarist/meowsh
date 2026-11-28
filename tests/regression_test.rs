@@ -454,3 +454,318 @@ fn systell_rejects_fd_above_i32_max() {
     assert!(o.signal.is_none());
     assert_ne!(o.status, Some(0));
 }
+
+// Differences from zsh found by running the same scripts through both.
+
+fn zsh_in(dir: &std::path::Path, script: &str) -> Out {
+    run_mode(false, &["-c", script], "", Some(dir))
+}
+
+#[test]
+fn startup_parameters_have_zsh_defaults() {
+    let o = zsh(
+        "print $signals[1,3] $TMPPREFIX $KEYTIMEOUT $LISTMAX $HISTCHARS $OPTIND $FUNCNEST \
+         $TRY_BLOCK_ERROR $#patchars; print -r -- $WORDCHARS; print ${+ZSH_NAME}",
+    );
+    assert_eq!(
+        o.stdout,
+        "EXIT HUP INT /tmp/zsh 40 100 !^# 1 500 -1 15\n*?_-.[]~=/&;!#$%^(){}<>\n1\n"
+    );
+}
+
+#[test]
+fn type_flag_describes_special_parameters() {
+    let o = zsh(
+        "print ${(t)?} ${(t)argv} ${(t)IFS} ${(t)options} ${(t)OPTIND} ${(t)funcstack}; \
+         f() { local IFS=x; print ${(t)IFS} }; f",
+    );
+    assert_eq!(
+        o.stdout,
+        "integer-readonly-special array-special scalar-special \
+         association-hide-hideval-special integer-special \
+         array-readonly-hide-hideval-special\nscalar-local-special\n"
+    );
+}
+
+#[test]
+fn lineno_is_read_only() {
+    let o = zsh("LINENO=5; print reached");
+    assert_eq!(o.stdout, "");
+    assert!(
+        o.stderr.contains("read-only variable: LINENO"),
+        "{}",
+        o.stderr
+    );
+}
+
+#[test]
+fn nested_command_substitution_splits_into_words() {
+    let o = zsh(
+        "print ${$(print a b c)[2]} ${#$(print a b c)} ${(j:-:)$(print a b c)}; \
+         print \"[${$(print a b c)[2]}]\"; x=${$(print 'a   b')}; print -r -- $x",
+    );
+    assert_eq!(o.stdout, "b 3 a-b-c\n[ ]\na b\n");
+    // A non-blank separator keeps the empty words, as plain $(...) does.
+    let o = zsh(
+        "IFS=:; print ${#$(print a::b)} ${#$(print a:b:)} ${#$(print :a)}; \
+         IFS=' :'; print ${#$(print 'a : b::c')}",
+    );
+    assert_eq!(o.stdout, "3 3 2\n4\n");
+}
+
+#[test]
+fn zerr_trap_sees_the_failing_status() {
+    let o = zsh("trap 'print err $?' ZERR; false; (exit 3); f() { return 4 }; f");
+    assert_eq!(o.stdout, "err 1\nerr 3\nerr 4\n");
+}
+
+#[test]
+fn err_return_ends_a_script_at_top_level() {
+    let o = zsh("setopt errreturn; false; print after");
+    assert_eq!(o.stdout, "");
+    assert_eq!(o.status, Some(1));
+}
+
+#[test]
+fn return_outside_a_function_leaves_the_shell() {
+    let o = zsh("(return 3); print $?; return 7; print notreached");
+    assert_eq!(o.stdout, "3\n");
+    assert_eq!(o.status, Some(7));
+    assert_eq!(o.stderr, "");
+}
+
+#[test]
+fn exit_trap_context_names_where_the_shell_ended() {
+    let trap = "trap 'print $ZSH_EVAL_CONTEXT' EXIT";
+    // -c keeps its frame whether the string runs out or calls exit.
+    assert_eq!(zsh(trap).stdout, "cmdarg:trap\n");
+    assert_eq!(zsh(&format!("{}; exit", trap)).stdout, "cmdarg:trap\n");
+    let tmp = TempDir::new().unwrap();
+    let script = |body: &str| {
+        let path = tmp.path().join("s");
+        std::fs::write(&path, body).unwrap();
+        run_mode(false, &[path.to_str().unwrap()], "", None).stdout
+    };
+    // A script that runs out has left the top level; one that exits has not.
+    assert_eq!(script(&format!("{}\n", trap)), "trap\n");
+    assert_eq!(script(&format!("{}\nexit\n", trap)), "toplevel:trap\n");
+    // Standard input behaves like a script.
+    assert_eq!(run_mode(false, &[], trap, None).stdout, "trap\n");
+}
+
+#[test]
+fn integer_to_negative_power_is_real() {
+    let o = zsh("print $(( 2 ** -2 )) $(( 2 ** 3 ))");
+    assert_eq!(o.stdout, "0.25 8\n");
+}
+
+#[test]
+fn floats_print_seventeen_significant_digits() {
+    let o = zsh("print $(( 3.7 )) $(( 0.1 )) $(( 2.5 )) $(( 1e21 )) $(( 1.5e300 ))");
+    assert_eq!(
+        o.stdout,
+        "3.7000000000000002 0.10000000000000001 2.5 1e+21 1.5000000000000001e+300\n"
+    );
+}
+
+#[test]
+fn oversized_integer_is_truncated_with_a_warning() {
+    let o = zsh("print $(( 9223372036854775808 )) $(( 0xffffffffffffffff ))");
+    assert_eq!(o.stdout, "922337203685477580 1152921504606846975\n");
+    assert!(
+        o.stderr.contains("number truncated after 18 digits"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("number truncated after 15 digits"),
+        "{}",
+        o.stderr
+    );
+}
+
+#[test]
+fn sort_flags_follow_zsh() {
+    let o = zsh(
+        "LC_ALL=C; a=(c B a 10 9 A b); print ${(o)a}; print ${(i)a}; print ${(Oi)a}; \
+         print ${(n)a}; print ${(a)a}; print ${(Oa)a}",
+    );
+    assert_eq!(
+        o.stdout,
+        "10 9 A B a b c\n10 9 a A B b c\nc B b a A 9 10\n9 10 A B a b c\n\
+         c B a 10 9 A b\nb A 9 10 a B c\n"
+    );
+}
+
+#[test]
+fn wait_for_a_pid_after_a_bare_wait() {
+    let o = zsh("{ sleep 0.05; exit 2 } & pid=$!; wait; wait $pid; print $?");
+    assert_eq!(o.stdout, "2\n");
+    assert_eq!(o.stderr, "");
+}
+
+#[test]
+fn key_and_value_flags_on_searched_hash_subscripts() {
+    let o = zsh(
+        "typeset -A h=(a 1 b 2 c 3); print ${(k)h[(I)[ab]]} / ${(v)h[(I)[ab]]} / \
+         ${(kv)h[(I)[ab]]} / ${(kv)h[(R)[12]]} / ${(kv)h[(i)a]} / ${(k)h[(r)2]} / \
+         ${(v)h[(i)a]}; arr=(apple banana cherry); print ${(k)arr[(r)b*]} ${arr[(r)b*]}",
+    );
+    assert_eq!(
+        o.stdout,
+        "a b / 1 2 / a 1 b 2 / a 1 b 2 / a 1 / b / 1\n2 banana\n"
+    );
+}
+
+#[test]
+fn length_of_a_default_word() {
+    let o = zsh("set -- a b; print ${#:-abc} ${#:-} ${#} ${##}");
+    assert_eq!(o.stdout, "3 0 2 1\n");
+}
+
+#[test]
+fn options_hash_takes_any_spelling() {
+    let o = zsh(
+        "setopt NO_GLOB; print $options[glob] $options[noglob] $options[NO_GLOB]; \
+         setopt glob; setopt -m 'hist*dups'; print $options[histignoredups] $options[histsavenodups]",
+    );
+    assert_eq!(o.stdout, "off on on\non on\n");
+    assert_eq!(o.stderr, "");
+}
+
+#[test]
+fn alias_listing_covers_global_aliases() {
+    let o = zsh(
+        "unalias -a; alias -g G=global; alias r=regular; alias -s x=suf; alias; alias -L; \
+         alias +; alias -g; alias -s",
+    );
+    assert_eq!(
+        o.stdout,
+        "G=global\nr=regular\nalias -g G=global\nalias r=regular\nG\nr\nG=global\nx=suf\n"
+    );
+    assert_eq!(o.stderr, "");
+}
+
+#[test]
+fn glob_qualifiers_see_links_unless_followed() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let tmp = TempDir::new().unwrap();
+    let d = tmp.path();
+    for (name, mode) in [("a", 0o600), ("b", 0o755)] {
+        std::fs::write(d.join(name), "x").unwrap();
+        std::fs::set_permissions(d.join(name), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    symlink("a", d.join("l")).unwrap();
+    symlink("missing", d.join("bl")).unwrap();
+    let o = zsh_in(
+        d,
+        "print *(.); print *(-.); print *(-@); print *(@x); print *(.L1) / *(l1)",
+    );
+    assert_eq!(o.stdout, "a b\na b l\nbl\nbl l\na b / a b bl l\n");
+}
+
+#[test]
+fn word_split_flag_keeps_empty_fields() {
+    let o = zsh(
+        "IFS=:; x='a::b:'; set -- ${=x}; print $#; y=':a'; set -- ${=y}; print $#; \
+         IFS=' :'; z='a : b::c'; set -- ${=z}; print $#",
+    );
+    assert_eq!(o.stdout, "4\n2\n4\n");
+}
+
+#[test]
+fn printf_assigns_to_an_element() {
+    let o = zsh("printf -v 'arr[2]' x; print $#arr; typeset -A h; printf -v 'h[k]' z; print $h[k]");
+    assert_eq!(o.stdout, "2\nz\n");
+}
+
+#[test]
+fn array_value_for_a_scalar_element_is_an_error() {
+    let o = zsh("s=abc; s[1]=(); print $s");
+    assert_eq!(o.stdout, "");
+    assert!(
+        o.stderr
+            .contains("attempt to assign array value to non-array"),
+        "{}",
+        o.stderr
+    );
+}
+
+#[test]
+fn autoload_x_outside_a_function_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let script = tmp.path().join("s");
+    std::fs::write(&script, "autoload -X\n").unwrap();
+    let o = run_mode(false, &[script.to_str().unwrap()], "", None);
+    assert_eq!(o.signal, None);
+    assert_eq!(o.status, Some(1));
+    assert!(o.stderr.contains("bad option(s)"), "{}", o.stderr);
+    // Under -c zsh words it differently.
+    let o = zsh("autoload -X");
+    assert_eq!(o.status, Some(1));
+    assert!(o.stderr.contains("bad autoload"), "{}", o.stderr);
+}
+
+#[test]
+fn autoload_k_runs_the_file_then_the_function() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("af"),
+        "af() { print inner } ; print outer\n",
+    )
+    .unwrap();
+    let o = zsh_in(
+        tmp.path(),
+        "fpath=(.); autoload -Uk af; functions af; af; af",
+    );
+    assert_eq!(
+        o.stdout,
+        "af () {\n\t# undefined\n\tbuiltin autoload -XUk\n}\nouter\ninner\ninner\n"
+    );
+}
+
+#[test]
+fn read_keys_need_a_terminal_or_a_descriptor() {
+    let o = zsh("read -u0 -k 3 k <<<abcdef; print \"[$k]\"");
+    assert_eq!(o.stdout, "[abc]\n");
+}
+
+#[test]
+fn cd_rejects_three_arguments() {
+    let o = zsh("cd /etc /usr /x");
+    assert_eq!(o.status, Some(1));
+    assert!(o.stderr.contains("too many arguments"), "{}", o.stderr);
+}
+
+#[test]
+fn empty_pattern_replaces_before_each_character_only() {
+    let o = zsh("x=abc; print ${x///X}");
+    assert_eq!(o.stdout, "XaXbXc\n");
+}
+
+#[test]
+fn brace_range_of_non_ascii_letters() {
+    let o = zsh("LC_ALL=en_US.UTF-8; print {é..ë}");
+    assert_eq!(o.stdout, "é ê ë\n");
+    // With single-byte characters it is not a range of two characters.
+    let o = zsh("LC_ALL=C; print {é..ë} {a..c}");
+    assert_eq!(o.stdout, "{é..ë} a b c\n");
+}
+
+#[test]
+fn tilde_number_names_a_directory_stack_entry() {
+    let o = zsh("cd /tmp; pushd /usr >/dev/null; pushd /etc >/dev/null; \
+         print ~0 ~1 ~2 ~+1 ~-0 ~-1 ~1/x; print ~9");
+    assert_eq!(o.stdout, "/etc /usr /tmp /usr /tmp /usr /usr/x\n");
+    assert!(
+        o.stderr.contains("not enough directory stack entries."),
+        "{}",
+        o.stderr
+    );
+}
+
+#[test]
+fn print_columns_without_a_terminal_is_one_column() {
+    let o = zsh("unset COLUMNS; print -c a b c");
+    assert_eq!(o.stdout, "a\nb\nc\n");
+}

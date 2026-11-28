@@ -996,8 +996,20 @@ pub fn builtin_wait(args: &[String]) -> i32 {
                 .map(|p| p.pid)
                 .collect()
         });
-        for pid in pids {
+        for &pid in &pids {
             wait_pid(pid);
+        }
+        // Each status stays available to a later `wait pid`.
+        let done: Vec<(i32, i32)> = with_shell(|s| {
+            let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.iter()
+                .flat_map(|j| j.procs.iter())
+                .filter(|p| p.state == ProcState::Done && pids.contains(&p.pid))
+                .map(|p| (p.pid, p.status))
+                .collect()
+        });
+        for (pid, status) in done {
+            remember_bg_status(pid, status);
         }
         finish_wait();
         return 0;

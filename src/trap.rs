@@ -73,6 +73,19 @@ pub fn signal_number(spec: &str) -> Option<i32> {
     SIGNALS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
 
+/// `$signals`: EXIT, the system's signals by number, then zsh's two
+/// pseudo-signals.
+pub fn signal_list() -> Vec<String> {
+    let mut sigs: Vec<(&str, i32)> = SIGNALS.to_vec();
+    sigs.sort_by_key(|(_, n)| *n);
+    sigs.dedup_by_key(|(_, n)| *n);
+    std::iter::once("EXIT")
+        .chain(sigs.iter().map(|(n, _)| *n))
+        .chain(["ZERR", "DEBUG"])
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub fn signal_name(sig: i32) -> String {
     match sig {
         0 => return "EXIT".to_string(),

@@ -640,6 +640,32 @@ fn tilde(chars: &[char], i: usize, assign: bool) -> Result<Option<(String, usize
         "" => var_get_opt("HOME").or_else(|| home_of(None)),
         "+" => var_get_opt("PWD"),
         "-" => var_get_opt("OLDPWD"),
+        // ~N, ~+N, ~-N: an entry of the directory stack as `dirs` shows
+        // it, counted from the top, or with `-` from the bottom.
+        u if u
+            .strip_prefix(['+', '-'])
+            .unwrap_or(u)
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            && u.chars().any(|c| c.is_ascii_digit()) =>
+        {
+            let n: usize = u
+                .trim_start_matches(['+', '-'])
+                .parse()
+                .unwrap_or(usize::MAX);
+            let mut dirs = vec![var_get("PWD")];
+            dirs.extend(with_shell(|s| s.dir_stack.clone()));
+            let from_end = u.starts_with('-') != crate::options::is_set("pushdminus");
+            let idx = if from_end {
+                dirs.len().checked_sub(1).and_then(|l| l.checked_sub(n))
+            } else {
+                Some(n)
+            };
+            match idx.and_then(|k| dirs.get(k).cloned()) {
+                Some(d) => Some(d),
+                None => return Err("not enough directory stack entries.".to_string()),
+            }
+        }
         u => match crate::shell::named_dir(u).or_else(|| home_of(Some(u))) {
             Some(d) => Some(d),
             None => {
@@ -1167,6 +1193,8 @@ struct PFlags {
     quote_plus: bool,
     unquote: bool,
     sort: Option<char>,
+    // (a): array index order; with (O), reversed.
+    index_order: bool,
     numeric: bool,
     icase: bool,
     unique: bool,
@@ -1281,7 +1309,7 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             }
             'Q' => f.unquote = true,
             'o' | 'O' => f.sort = Some(c),
-            'a' => {}
+            'a' => f.index_order = true,
             'n' => f.numeric = true,
             '-' => f.signed = true,
             'i' => f.icase = true,
@@ -2240,6 +2268,21 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     };
     Ok(match assoc_get(name, &key) {
         Some(v) => Val::Str(v),
+        // $options[noglob], $options[NO_GLOB]: any spelling setopt takes.
+        None if name == "options"
+            && with_shell(|s| {
+                s.param("options")
+                    .is_some_and(|p| p.level == 0 && p.attrs & crate::params::READONLY == 0)
+            }) =>
+        {
+            match crate::options::resolve(&key) {
+                Some((opt, same)) => {
+                    let on = crate::options::is_set(opt) == same;
+                    Val::Str(if on { "on" } else { "off" }.to_string())
+                }
+                None => Val::Unset,
+            }
+        }
         None => Val::Unset,
     })
 }
@@ -3321,10 +3364,146 @@ fn computed_special_type(name: &str) -> Option<String> {
     })
 }
 
+// zsh's own parameters and how `${(t)...}` describes each: the kind
+// (i integer, s scalar, a array, A association), read-only, hidden.
+const SPECIAL_TYPES: &[(&str, char, bool, bool)] = &[
+    ("HISTSIZE", 'i', false, false),
+    ("SAVEHIST", 'i', false, false),
+    ("OPTIND", 'i', false, false),
+    ("FUNCNEST", 'i', false, false),
+    ("TRY_BLOCK_ERROR", 'i', false, false),
+    ("TRY_BLOCK_INTERRUPT", 'i', false, false),
+    ("SHLVL", 'i', false, false),
+    ("PPID", 'i', true, false),
+    ("?", 'i', true, false),
+    ("#", 'i', true, false),
+    ("!", 'i', true, false),
+    ("$", 'i', true, false),
+    ("status", 'i', true, false),
+    ("0", 's', false, false),
+    ("IFS", 's', false, false),
+    ("_", 's', false, false),
+    ("-", 's', true, false),
+    ("OPTARG", 's', false, false),
+    ("PS1", 's', false, false),
+    ("PS2", 's', false, false),
+    ("PS3", 's', false, false),
+    ("PS4", 's', false, false),
+    ("PROMPT", 's', false, false),
+    ("prompt", 's', false, false),
+    ("HOME", 's', false, false),
+    ("WORDCHARS", 's', false, false),
+    ("HISTCHARS", 's', false, false),
+    ("histchars", 's', false, false),
+    ("NULLCMD", 's', false, false),
+    ("READNULLCMD", 's', false, false),
+    ("LANG", 's', false, false),
+    ("LC_ALL", 's', false, false),
+    ("argv", 'a', false, false),
+    ("pipestatus", 'a', false, false),
+    ("@", 'a', true, false),
+    ("*", 'a', true, false),
+    ("options", 'A', false, true),
+    ("functions", 'A', false, true),
+    ("commands", 'A', false, true),
+    ("aliases", 'A', false, true),
+    ("galiases", 'A', false, true),
+    ("saliases", 'A', false, true),
+    ("nameddirs", 'A', false, true),
+    ("dis_aliases", 'A', false, true),
+    ("dis_functions", 'A', false, true),
+    ("parameters", 'A', true, true),
+    ("modules", 'A', true, true),
+    ("history", 'A', true, true),
+    ("jobstates", 'A', true, true),
+    ("jobdirs", 'A', true, true),
+    ("jobtexts", 'A', true, true),
+    ("userdirs", 'A', true, true),
+    ("usergroups", 'A', true, true),
+    ("builtins", 'A', true, true),
+    ("dis_builtins", 'A', true, true),
+    ("widgets", 'A', true, true),
+    ("functions_source", 'A', true, true),
+    ("dirstack", 'a', false, true),
+    ("reswords", 'a', true, true),
+    ("dis_reswords", 'a', true, true),
+    ("funcstack", 'a', true, true),
+    ("funcfiletrace", 'a', true, true),
+    ("funcsourcetrace", 'a', true, true),
+    ("functrace", 'a', true, true),
+    ("keymaps", 'a', true, true),
+    ("historywords", 'a', true, true),
+    ("patchars", 'a', true, true),
+    ("dis_patchars", 'a', true, true),
+];
+
+// `${(t)...}` of zsh's own parameters, however this shell stores them.
+fn builtin_special_type(name: &str) -> Option<String> {
+    let &(_, kind, readonly, hidden) = SPECIAL_TYPES.iter().find(|(n, ..)| *n == name)?;
+    if crate::exec::sh_emulation_pub() {
+        return None;
+    }
+    let stored = || {
+        with_shell(|s| {
+            s.param(name)
+                .map(|p| (p.level, p.attrs, p.is_array(), p.is_assoc()))
+        })
+    };
+    let mut found = stored();
+    if found.is_none() {
+        // Some are answered without a parameter behind them.
+        let known = match name {
+            "functions" => crate::zparam::functions_special(),
+            "aliases" | "galiases" | "saliases" => true,
+            _ => !matches!(lookup(name), Val::Unset) || assoc_keys(name).is_some(),
+        };
+        if !known {
+            return None;
+        }
+        found = stored();
+    }
+    let (mut export, mut local) = (false, false);
+    if let Some((level, attrs, is_array, is_assoc)) = found {
+        // A parameter of another kind is the user's own.
+        if attrs & crate::params::UNSET != 0
+            || is_array != (kind == 'a')
+            || is_assoc != (kind == 'A')
+        {
+            return None;
+        }
+        // `$_` arrives through the environment but is never exported.
+        export = attrs & crate::params::EXPORT != 0 && name != "_";
+        local = level > 0;
+    }
+    let mut t = String::from(match kind {
+        'i' => "integer",
+        'a' => "array",
+        'A' => "association",
+        _ => "scalar",
+    });
+    if local {
+        t.push_str("-local");
+    }
+    if readonly {
+        t.push_str("-readonly");
+    }
+    if export {
+        t.push_str("-export");
+    }
+    if hidden {
+        t.push_str("-hide-hideval");
+    }
+    t.push_str("-special");
+    Some(t)
+}
+
 // `${(t)name}`, in zsh's format: the type, then -local and attributes.
 fn type_of(name: &str) -> String {
     use crate::params::*;
     if let Some(t) = computed_special_type(name) {
+        return t;
+    }
+    if let Some(t) = builtin_special_type(name) {
         return t;
     }
     with_shell(|s| {
@@ -3503,50 +3682,72 @@ fn split_items(items: Vec<String>, sep: &str, keep_empty: bool) -> Vec<String> {
 /// Name order with digit runs compared by value, as NUMERIC_GLOB_SORT
 /// and the (n) flag use.
 pub fn numeric_order(a: &str, b: &str) -> std::cmp::Ordering {
-    numeric_cmp(a, b, false)
+    sort_cmp(a, b, 1)
 }
 
-// zsh's numeric sort ((n), and (-) for signed numbers): runs of digits
-// compare by value, everything else character by character.
-fn numeric_cmp(a: &str, b: &str, signed: bool) -> std::cmp::Ordering {
+/// zsh's eltpcmp (Src/sort.c): locale collation, and with `numeric`
+/// set (1, or -1 for signed numbers) the digit runs at the first
+/// difference compare by value.
+pub fn sort_cmp(a: &str, b: &str, numeric: i8) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let (mut i, mut j) = (0, 0);
-    let number = |s: &[char], k: usize| -> Option<(i128, usize)> {
-        let neg =
-            signed && s.get(k) == Some(&'-') && s.get(k + 1).is_some_and(|c| c.is_ascii_digit());
-        let start = if neg { k + 1 } else { k };
-        if !s.get(start).is_some_and(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let mut end = start;
-        while end < s.len() && s[end].is_ascii_digit() {
-            end += 1;
-        }
-        let text: String = s[start..end].iter().collect();
-        let v: i128 = text.parse().unwrap_or(i128::MAX);
-        Some((if neg { -v } else { v }, end))
-    };
-    while i < a.len() && j < b.len() {
-        if let (Some((x, ni)), Some((y, nj))) = (number(&a, i), number(&b, j)) {
-            match x.cmp(&y) {
-                Ordering::Equal => {
-                    i = ni;
-                    j = nj;
-                    continue;
-                }
-                o => return o,
-            }
-        }
-        match a[i].cmp(&b[j]) {
-            Ordering::Equal => {
-                i += 1;
-                j += 1;
-            }
-            o => return o,
+    let mut cmp = crate::shell::collate(a, b);
+    if numeric == 0 {
+        return cmp;
+    }
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    let at = |s: &[u8], k: usize| s.get(k).copied().unwrap_or(0);
+    let dig = |c: u8| c.is_ascii_digit();
+    let mut i = 0;
+    while at(x, i) == at(y, i) && at(x, i) != 0 {
+        i += 1;
+    }
+    let mut mul = 0i32;
+    if numeric < 0 {
+        if at(x, i) == b'-' && dig(at(x, i + 1)) && dig(at(y, i)) {
+            cmp = Ordering::Less;
+            mul = 1;
+        } else if at(y, i) == b'-' && dig(at(y, i + 1)) && dig(at(x, i)) {
+            cmp = Ordering::Greater;
+            mul = 1;
         }
     }
-    (a.len() - i).cmp(&(b.len() - j))
+    if mul == 0 && (dig(at(x, i)) || dig(at(y, i))) {
+        while i > 0 && dig(x[i - 1]) {
+            i -= 1;
+        }
+        mul = if numeric < 0 && i > 0 && x[i - 1] == b'-' {
+            -1
+        } else {
+            1
+        };
+        if dig(at(x, i)) && dig(at(y, i)) {
+            let (mut p, mut q) = (i, i);
+            while at(x, p) == b'0' {
+                p += 1;
+            }
+            while at(y, q) == b'0' {
+                q += 1;
+            }
+            while dig(at(x, p)) && at(x, p) == at(y, q) {
+                p += 1;
+                q += 1;
+            }
+            if dig(at(x, p)) || dig(at(y, q)) {
+                cmp = (mul * (at(x, p) as i32 - at(y, q) as i32)).cmp(&0);
+                while dig(at(x, p)) && dig(at(y, q)) {
+                    p += 1;
+                    q += 1;
+                }
+                if dig(at(x, p)) && !dig(at(y, q)) {
+                    return mul.cmp(&0);
+                }
+                if dig(at(y, q)) && !dig(at(x, p)) {
+                    return (-mul).cmp(&0);
+                }
+            }
+        }
+    }
+    cmp
 }
 
 // The flags in zsh's order (the "Rules" in zshexpn): forced joining,
@@ -3555,6 +3756,7 @@ fn numeric_cmp(a: &str, b: &str, signed: bool) -> std::cmp::Ordering {
 fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
     // `${=x-"a b" $y}`: splitting leaves the quoted parts of the word whole.
     let mut ifs_done = false;
+    let mut ifs_empties = false;
     let val = match val {
         Val::Tagged(fields) if f.ifs_split && f.split.is_none() => {
             let ifs = ifs();
@@ -3700,13 +3902,9 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
         let ifs = ifs();
         let words: Vec<String> = val_items(&val)
             .iter()
-            .flat_map(|s| {
-                s.split(|c| ifs.contains(c))
-                    .filter(|w| !w.is_empty())
-                    .map(|w| w.to_string())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|s| ifs_words(s, &ifs))
             .collect();
+        ifs_empties = !quoted && words.iter().any(|w| w.is_empty());
         val = Val::List(words, false);
     } else if f.zsplit {
         let items = val_items(&val);
@@ -3802,16 +4000,37 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
         let mut seen = std::collections::HashSet::new();
         items.retain(|s| seen.insert(s.clone()));
     }
-    if f.sort.is_some() || f.numeric || f.signed {
-        if f.numeric || f.signed {
-            items.sort_by(|a, b| numeric_cmp(a, b, f.signed));
-        } else if f.icase {
-            items.sort_by_key(|s| s.to_lowercase());
+    if f.sort.is_some() || f.numeric || f.signed || f.icase || f.index_order {
+        let backwards = f.sort == Some('O');
+        if f.index_order {
+            if backwards {
+                items.reverse();
+            }
         } else {
-            items.sort();
-        }
-        if f.sort == Some('O') {
-            items.reverse();
+            let numeric = if f.signed {
+                -1
+            } else if f.numeric {
+                1
+            } else {
+                0
+            };
+            let mut keyed: Vec<(String, String)> = items
+                .drain(..)
+                .map(|s| {
+                    let key = if f.icase { s.to_lowercase() } else { s.clone() };
+                    (key, s)
+                })
+                .collect();
+            // A stable sort in each direction, so equal keys keep their order.
+            keyed.sort_by(|a, b| {
+                let o = sort_cmp(&a.0, &b.0, numeric);
+                if backwards {
+                    o.reverse()
+                } else {
+                    o
+                }
+            });
+            items.extend(keyed.into_iter().map(|(_, s)| s));
         }
     }
     if f.eval {
@@ -3863,7 +4082,64 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             out = Val::List(items, false);
         }
     }
+    // `${=x}` keeps the empty words a non-blank separator made, unlike
+    // other unquoted lists.
+    if ifs_empties {
+        if let Val::List(items, _) = &out {
+            let tag = if crate::options::is_set("globsubst") {
+                0
+            } else {
+                NG
+            };
+            let fields = items
+                .iter()
+                .map(|w| {
+                    let mut field = vec![('\0', MARK)];
+                    field.extend(w.chars().map(|c| (c, tag)));
+                    field
+                })
+                .collect();
+            return Ok(Val::Tagged(fields));
+        }
+    }
     Ok(out)
+}
+
+// Splits `s` on the characters of `ifs` as zsh's (=) does: blanks run
+// together and are dropped at the ends; any other separator ends a word
+// even when that word is empty.
+fn ifs_words(s: &str, ifs: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let sep = |c: char| ifs.contains(c);
+    let blank = |c: char| matches!(c, ' ' | '\t' | '\n') && ifs.contains(c);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && blank(chars[i]) {
+        i += 1;
+    }
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && !sep(chars[i]) {
+            i += 1;
+        }
+        out.push(chars[start..i].iter().collect::<String>());
+        // One separator: blanks, at most one other, more blanks.
+        let mut hard = false;
+        while i < chars.len() && blank(chars[i]) {
+            i += 1;
+        }
+        if i < chars.len() && sep(chars[i]) {
+            hard = true;
+            i += 1;
+            while i < chars.len() && blank(chars[i]) {
+                i += 1;
+            }
+        }
+        if i == chars.len() && hard {
+            out.push(String::new());
+        }
+    }
+    out
 }
 
 // zsh's non-forking command substitutions: `${ cmd }` (its output),
@@ -4111,6 +4387,8 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             '#' if starts_param(next) && !(next == Some('#') && i + 2 < body.len()) => {
                 length = true
             }
+            // `${#:-word}`: the length of the word.
+            '#' if next == Some(':') && body.get(i + 2) == Some(&'-') => length = true,
             '+' if starts_param(next) => set_test = true,
             // `^` turns RC_EXPAND_PARAM on for this expansion, `^^` off.
             '^' if starts_param(next) || matches!(next, Some('^' | ':' | '~' | '=')) => {
@@ -4257,7 +4535,17 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             Val::Str(arith_text(&body[i + 3..end - 2])?)
         } else {
             let src: String = body[i + 2..end - 1].iter().collect();
-            Val::Str(command_subst(&src)?)
+            let text = command_subst(&src)?;
+            // Unquoted, the output splits into an array of words before
+            // anything outside applies.
+            if mode == Mode::Unquoted {
+                let ifs = ifs();
+                // The splitter `${=x}` uses: a non-blank separator keeps
+                // the empty words around it.
+                Val::List(ifs_words(&text, &ifs), true)
+            } else {
+                Val::Str(text)
+            }
         };
         i = end;
     } else if body.get(i) == Some(&'"') {
@@ -4377,35 +4665,56 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                 Some(keys) => Val::List(keys, true),
                 None => ksh_first(&name, param_value(&name, None)?),
             }
-        } else if flags.keys
+        } else if (flags.keys || flags.values)
             && assoc_keys(&name).is_some()
+            && sub
+                .as_deref()
+                .and_then(search_flags)
+                .is_some_and(|(sf, _)| sf.contains(['r', 'R', 'i', 'I']))
+        {
+            // ${(k)assoc[(r)pat]}: a search finds key and value pairs,
+            // by value for (r)/(R) and by key for (i)/(I); (k) and (v)
+            // choose which side of each pair comes out.
+            let s = sub.clone().unwrap();
+            let (sf, word) = search_flags(&s).unwrap();
+            let sf = sf.as_str();
+            let hit = matcher(word, sf.contains('e'))?;
+            let by_value = sf.contains(['r', 'R']);
+            let every = sf.contains(['R', 'I']);
+            let mut out = Vec::new();
+            for k in assoc_keys(&name).unwrap_or_default() {
+                let v = assoc_get(&name, &k).unwrap_or_default();
+                if !hit(if by_value { &v } else { &k }) {
+                    continue;
+                }
+                if flags.keys {
+                    out.push(k);
+                }
+                if flags.values {
+                    out.push(v);
+                }
+                if !every {
+                    break;
+                }
+            }
+            match out.len() {
+                0 if !every => Val::Unset,
+                1 if !every => Val::Str(out.remove(0)),
+                _ => Val::List(out, !(flags.keys && flags.values)),
+            }
+        } else if flags.keys
+            && !flags.values
+            && with_shell(|s| s.array(&name).is_some())
             && sub
                 .as_deref()
                 .and_then(search_flags)
                 .is_some_and(|(sf, _)| sf.contains(['r', 'R']))
         {
-            // ${(k)assoc[(r)pat]}: the key whose value matches; (R) all of them.
-            // ((i) and (I) give keys anyway.)
+            // ${(k)array[(r)pat]}: the index of the match, not the element.
             let s = sub.clone().unwrap();
             let (sf, word) = search_flags(&s).unwrap();
-            let sf = sf.as_str();
-            let hit = matcher(word, sf.contains('e'))?;
-            let keys = assoc_keys(&name).unwrap_or_default();
-            let mut found = keys
-                .into_iter()
-                .filter(|k| hit(&assoc_get(&name, k).unwrap_or_default()));
-            match found.next() {
-                Some(k) if sf.contains('R') && !flags.values => {
-                    Val::List(std::iter::once(k).chain(found).collect(), true)
-                }
-                // (kv): the key and its value.
-                Some(k) if flags.values => {
-                    let v = assoc_get(&name, &k).unwrap_or_default();
-                    Val::List(vec![k, v], false)
-                }
-                Some(k) => Val::Str(k),
-                None => Val::Unset,
-            }
+            let by_index = format!("({}){}", sf.replace('r', "i").replace('R', "I"), word);
+            param_value(&name, Some(&by_index))?
         } else if flags.keys
             && !flags.values
             && sub
@@ -5388,10 +5697,6 @@ fn ansi_c_opts(
                     }
                 }
             }
-            'c' if i < n => {
-                out.push(char::from_u32((chars[i] as u32) & 0x1f).unwrap_or('?'));
-                i += 1;
-            }
             _ => {
                 if keep_unknown {
                     out.push('\\');
@@ -5535,6 +5840,15 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
                     .map(u32::from)
                     .unwrap_or(c as u32)
             };
+            // Only a byte that was not valid text comes back as one.
+            let raw = [ca[0], cb[0]]
+                .iter()
+                .any(|&c| crate::shell::decode_raw_byte(c).is_some());
+            // Where characters are single bytes a multibyte letter is not
+            // one character, so there is no range: the braces stay.
+            if !raw && [ca[0], cb[0]].iter().any(|c| !c.is_ascii()) && crate::shell::is_c_locale() {
+                return None;
+            }
             let (mut a, mut b) = (to_ord(ca[0]), to_ord(cb[0]));
             let rev = b < a;
             if rev {
@@ -5546,7 +5860,7 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
                 .map(|c| {
                     if (!mb && (c as u32) <= 0xff) || (c as u32) < 32 || c == '\x7f' {
                         crate::shell::nice_byte_char(c as u8)
-                    } else if (0x80..=0xff).contains(&(c as u32)) {
+                    } else if raw && (0x80..=0xff).contains(&(c as u32)) {
                         crate::shell::raw_byte_char(c as u8).to_string()
                     } else {
                         c.to_string()

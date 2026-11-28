@@ -85,6 +85,34 @@ pub fn shell_init() {
     // that an error.
     set_default(&mut shell, "NULLCMD", "cat".to_string(), 0);
     set_default(&mut shell, "READNULLCMD", "more".to_string(), 0);
+    // zsh's other start-up defaults, which scripts read without setting.
+    for (name, value) in [
+        ("WORDCHARS", "*?_-.[]~=/&;!#$%^(){}<>"),
+        ("HISTCHARS", "!^#"),
+        ("histchars", "!^#"),
+        ("TMPPREFIX", "/tmp/zsh"),
+        ("TIMEFMT", "%J  %U user %S system %P cpu %*E total"),
+    ] {
+        set_default(&mut shell, name, value.to_string(), 0);
+    }
+    // Never inherited: zsh resets each of these at start-up. The ones the
+    // shell itself assigns while running a function stay plain text, so
+    // restoring them is not an arithmetic evaluation (which would replace
+    // the value a math function is about to return).
+    for (name, value, attrs) in [
+        ("KEYTIMEOUT", "40", crate::params::INTEGER),
+        ("LISTMAX", "100", crate::params::INTEGER),
+        ("FUNCNEST", "500", crate::params::INTEGER),
+        ("OPTIND", "1", 0),
+        ("TRY_BLOCK_ERROR", "-1", 0),
+        ("TRY_BLOCK_INTERRUPT", "-1", 0),
+    ] {
+        set(&mut shell, name, value.to_string(), attrs);
+    }
+    shell.params.insert(
+        "signals".to_string(),
+        Param::with(crate::params::Value::Array(crate::trap::signal_list())),
+    );
     // zsh frameworks such as oh-my-zsh refuse to load without
     // ZSH_VERSION. The suffix keeps per-version files (for example
     // ~/.zcompdump-host-$ZSH_VERSION) apart from real zsh's.
@@ -1177,6 +1205,10 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
         && with_shell(|s| s.param("status").is_none())
     {
         shell_err("read-only variable: status");
+        return false;
+    }
+    if name == "LINENO" && with_shell(|s| s.param("LINENO").is_none()) {
+        shell_err("read-only variable: LINENO");
         return false;
     }
     // zsh reserves the .zsh namespace for its own read-only parameters.
@@ -3043,6 +3075,56 @@ fn effective_lc_ctype() -> String {
         }
         String::new()
     })
+}
+
+static LAST_LC_COLLATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Compares two strings in the locale's collation order (`LC_ALL`,
+/// `LC_COLLATE`, `LANG`), as zsh sorts glob matches and `${(o)...}`.
+/// Strings the locale ranks equal fall back to byte order.
+pub fn collate(a: &str, b: &str) -> std::cmp::Ordering {
+    let want = sync_lc_collate();
+    if want == "C" || want == "POSIX" {
+        return a.cmp(b);
+    }
+    match (
+        std::ffi::CString::new(zstr_to_bytes(a)),
+        std::ffi::CString::new(zstr_to_bytes(b)),
+    ) {
+        (Ok(ca), Ok(cb)) => unsafe { libc::strcoll(ca.as_ptr(), cb.as_ptr()) }
+            .cmp(&0)
+            .then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    }
+}
+
+/// Brings libc's `LC_COLLATE` in line with the shell's `LC_ALL` /
+/// `LC_COLLATE` / `LANG`, for anything about to call strcoll. Returns
+/// the locale name in effect.
+pub fn sync_lc_collate() -> String {
+    let want = with_shell(|s| {
+        for k in ["LC_ALL", "LC_COLLATE", "LANG"] {
+            if let Some(p) = s.param(k) {
+                let v = p.text();
+                if p.attrs & crate::params::UNSET == 0 && !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+        "C".to_string()
+    });
+    {
+        let mut last = LAST_LC_COLLATE.lock().unwrap_or_else(|e| e.into_inner());
+        if last.as_deref() != Some(want.as_str()) {
+            if let Ok(c) = std::ffi::CString::new(zstr_to_bytes(&want)) {
+                if unsafe { libc::setlocale(libc::LC_COLLATE, c.as_ptr()) }.is_null() {
+                    unsafe { libc::setlocale(libc::LC_COLLATE, c"C".as_ptr()) };
+                }
+            }
+            *last = Some(want.clone());
+        }
+    }
+    want
 }
 
 /// Synchronizes libc `LC_CTYPE` with the shell's `LC_ALL` / `LC_CTYPE` / `LANG`.
