@@ -505,6 +505,12 @@ fn nested_command_substitution_splits_into_words() {
          print \"[${$(print a b c)[2]}]\"; x=${$(print 'a   b')}; print -r -- $x",
     );
     assert_eq!(o.stdout, "b 3 a-b-c\n[ ]\na b\n");
+    // A non-blank separator keeps the empty words, as plain $(...) does.
+    let o = zsh(
+        "IFS=:; print ${#$(print a::b)} ${#$(print a:b:)} ${#$(print :a)}; \
+         IFS=' :'; print ${#$(print 'a : b::c')}",
+    );
+    assert_eq!(o.stdout, "3 3 2\n4\n");
 }
 
 #[test]

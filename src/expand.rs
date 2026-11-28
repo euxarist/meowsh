@@ -4540,12 +4540,9 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             // anything outside applies.
             if mode == Mode::Unquoted {
                 let ifs = ifs();
-                let words: Vec<String> = text
-                    .split(|c| ifs.contains(c))
-                    .filter(|w| !w.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                Val::List(words, true)
+                // The splitter `${=x}` uses: a non-blank separator keeps
+                // the empty words around it.
+                Val::List(ifs_words(&text, &ifs), true)
             } else {
                 Val::Str(text)
             }
