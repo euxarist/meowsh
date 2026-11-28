@@ -2289,3 +2289,19 @@ print -r -- "${history[(r)echo*]}"
     assert_eq!(out, "echo item-12\n");
     assert!(err.is_empty(), "err={:?}", err);
 }
+
+#[test]
+fn completion_function_changes_to_prefix_are_undone_on_return() {
+    // zsh restores PREFIX, SUFFIX and the like when a function called
+    // during completion returns. Without that, a second matcher-list
+    // attempt starts from what the first one left and replaces the word.
+    let out = on_terminal(
+        "PROMPT='> '\n\
+         inner() { PREFIX=changed }\n\
+         comp() { inner; compadd -U -- \"got:$PREFIX\" }\n\
+         zle -C mycomp complete-word comp\n\
+         bindkey '^T' mycomp\n",
+        "echo foo\x14 \"[ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("got:foo [right]"), "output: {:?}", out);
+}

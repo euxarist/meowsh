@@ -2873,6 +2873,12 @@ pub fn code_origin() -> String {
 static TRACE_FROM_T: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
+    // During completion, what the function did to PREFIX, SUFFIX, words
+    // and the like is undone when it returns (zsh's comp_wrapper).
+    crate::zle::comp::complete::comp_wrapper(|| call_function_unwrapped(body, words, line))
+}
+
+fn call_function_unwrapped(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     // A pending `break` from `${ ... }` in the arguments skips the call.
     if let Some(f) = DEFERRED_FLOW.lock().ok().and_then(|mut d| d.take()) {
         with_shell(|s| s.flow = f);
