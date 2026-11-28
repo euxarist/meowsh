@@ -311,7 +311,7 @@ fn read_keys_and_yes_no() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
         .args([
             "-c",
-            "read -q && echo yes; read -k 1 c; echo \"[$c]\"; read -k 2; echo \"[$REPLY]\"",
+            "read -u0 -q && echo yes; read -u0 -k 1 c; echo \"[$c]\"; read -u0 -k 2; echo \"[$REPLY]\"",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

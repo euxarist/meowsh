@@ -404,7 +404,14 @@ fn print_main(name: &str, ops: &Ops, mut args: Vec<String>, printf: bool) -> i32
     if let Some(v) = ops.arg('v') {
         let ok = match array_out {
             Some(items) => crate::shell::array_set(v, items),
-            None => var_set(v, &out, false),
+            // -v 'name[sub]': one element of an array or hash.
+            None => match v.split_once('[').filter(|_| v.ends_with(']')) {
+                Some((n, sub)) if crate::lexer::is_valid_name(n) => {
+                    crate::exec::set_subscripted(n, &sub[..sub.len() - 1], &out, false)
+                        .unwrap_or(false)
+                }
+                _ => var_set(v, &out, false),
+            },
         };
         return if ok { ret } else { 1 };
     }
@@ -449,7 +456,8 @@ fn columns(args: &[String], ncols: usize, across: bool, fixed: bool, nul: bool, 
     } else {
         let l = widths.iter().copied().max().unwrap_or(0);
         sc = l + 2;
-        let cols = var_get("COLUMNS").parse::<usize>().unwrap_or(80);
+        // Without a terminal zsh's width is 0: a single column.
+        let cols = var_get("COLUMNS").parse::<usize>().unwrap_or(0);
         nc = ((cols + 1) / sc).max(1);
         nr = argc.div_ceil(nc);
     }

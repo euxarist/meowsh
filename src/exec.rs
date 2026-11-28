@@ -89,7 +89,11 @@ fn check_errexit(status: i32) {
     }
     // zsh's ZERR trap runs first, then ERR_EXIT or ERR_RETURN act.
     if live && trapped {
-        let pending = with_shell(|s| std::mem::replace(&mut s.flow, Flow::None));
+        let pending = with_shell(|s| {
+            // The trap sees the failing status in $?.
+            s.last_status = status;
+            std::mem::replace(&mut s.flow, Flow::None)
+        });
         crate::trap::run_pseudo(crate::trap::SIG_ZERR);
         // After the trap: running it (a TRAPZERR function) clears the flag.
         DONE_TRAP.store(true, Ordering::Relaxed);
@@ -106,13 +110,15 @@ fn check_errexit(status: i32) {
         }
         if live && s.opts & OPT_ERREXIT != 0 {
             s.flow = Flow::Exit(status);
-        } else if s.errreturn_suppressed == 0
-            && s.func_depth > 0
-            && crate::options::is_set_in(s, "errreturn")
-        {
-            // ERR_RETURN: leave the function with the failing status.
+        } else if s.errreturn_suppressed == 0 && crate::options::is_set_in(s, "errreturn") {
+            // ERR_RETURN: leave the function (or sourced file) with the
+            // failing status; at the top of a script that ends it.
             if s.flow == Flow::None {
-                s.flow = Flow::Return(status);
+                if s.func_depth > 0 || s.source_depth > 0 {
+                    s.flow = Flow::Return(status);
+                } else if live && !s.interactive {
+                    s.flow = Flow::Exit(status);
+                }
             }
         }
     });
@@ -1357,7 +1363,7 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
                 ));
                 return Err(1);
             }
-            ParamKind::Scalar | ParamKind::Numeric if a.append => {
+            ParamKind::Scalar | ParamKind::Numeric => {
                 shell_err(&format!(
                     "{}: attempt to assign array value to non-array",
                     a.name

@@ -663,14 +663,8 @@ fn builtin_exit(words: &[String]) -> i32 {
 }
 
 fn builtin_return(words: &[String]) -> i32 {
-    let (funcs, sources) = with_shell(|s| (s.func_depth, s.source_depth));
-    if funcs == 0 && sources == 0 {
-        builtin_err(
-            "return",
-            "can only `return' from a function or sourced script",
-        );
-        return 1;
-    }
+    let (funcs, sources, interactive) =
+        with_shell(|s| (s.func_depth, s.source_depth, s.interactive));
     let code = match words.get(1) {
         None => last_status(),
         // zsh evaluates the status as arithmetic: `exit $?+8`.
@@ -692,6 +686,15 @@ fn builtin_return(words: &[String]) -> i32 {
             }
         },
     };
+    // zsh's bin_break: outside a function or sourced file, `return`
+    // leaves a script (or subshell) like `exit`; an interactive shell
+    // only takes the status.
+    if funcs == 0 && sources == 0 {
+        if !interactive {
+            set_flow(Flow::Exit(code));
+        }
+        return code;
+    }
     set_flow(Flow::Return(code));
     code
 }
@@ -1571,6 +1574,8 @@ fn read_split(chars: &[(char, bool)], ifs: &str, n: usize) -> Vec<String> {
 
 fn builtin_read(words: &[String]) -> i32 {
     let mut fd = 0;
+    // -u or -p named where to read from.
+    let mut explicit_fd = false;
     let mut keys: Option<usize> = None;
     let mut yes_no = false;
     let mut raw = false;
@@ -1635,11 +1640,17 @@ fn builtin_read(words: &[String]) -> i32 {
                     yes_no = true;
                 }
                 'u' => match take_arg().and_then(|n| n.parse().ok()) {
-                    Some(n) => fd = n,
+                    Some(n) => {
+                        fd = n;
+                        explicit_fd = true;
+                    }
                     None => return usage("read", "-u: bad file descriptor"),
                 },
                 'p' => match with_shell(|s| s.coproc) {
-                    Some((_, r)) => fd = r,
+                    Some((_, r)) => {
+                        fd = r;
+                        explicit_fd = true;
+                    }
                     None => return usage("read", "-p: no coprocess"),
                 },
                 'E' => echo = true,
@@ -1703,9 +1714,26 @@ fn builtin_read(words: &[String]) -> i32 {
         }
     }
     if let Some(n) = keys {
-        let text = match read_chars(fd, n) {
-            Some(t) => t,
-            None => return 1,
+        // -k and -q read keys from the terminal, not standard input,
+        // unless -u or -p says otherwise.
+        let mut tty: Option<std::fs::File> = None;
+        if !explicit_fd && unsafe { libc::isatty(0) } != 1 {
+            match std::fs::File::open("/dev/tty") {
+                Ok(f) => {
+                    use std::os::fd::AsRawFd;
+                    fd = f.as_raw_fd();
+                    tty = Some(f);
+                }
+                Err(_) => {
+                    let _ = crate::sys::write_fd(2, b"not interactive and can't open terminal\n");
+                    return 1;
+                }
+            }
+        }
+        let text = read_chars(fd, n);
+        drop(tty);
+        let Some(text) = text else {
+            return 1;
         };
         let target = names
             .first()
@@ -2240,6 +2268,10 @@ fn cd_family(words: &[String], kind: CdKind) -> i32 {
         i += 1;
     }
     let args = &words[i..];
+    if args.len() > 2 {
+        builtin_err(cmd, "too many arguments");
+        return 1;
+    }
     let old_pwd = var_get_opt("PWD")
         .filter(|p| p.starts_with('/'))
         .or_else(physical_cwd)
@@ -2548,21 +2580,29 @@ fn builtin_history() -> i32 {
 fn builtin_alias(words: &[String]) -> i32 {
     let mut args = &words[1..];
     let (mut global, mut suffix, mut list_cmd, mut pattern) = (false, false, false, false);
+    // -r: regular aliases only; `+` instead of `-`: names without values.
+    let (mut regular, mut names_only) = (false, false);
     while let Some(a) = args.first() {
         if a == "--" {
             args = &args[1..];
             break;
         }
+        if a == "+" {
+            names_only = true;
+            args = &args[1..];
+            continue;
+        }
         let Some(flags) = a.strip_prefix(['-', '+']).filter(|f| !f.is_empty()) else {
             break;
         };
+        names_only |= a.starts_with('+');
         for c in flags.chars() {
             match c {
                 'g' => global = true,
                 's' => suffix = true,
                 'L' => list_cmd = true,
                 'm' => pattern = true,
-                'r' => {}
+                'r' => regular = true,
                 _ => {
                     builtin_err("alias", &format!("bad option: {}{}", &a[..1], c));
                     return 1;
@@ -2585,9 +2625,30 @@ fn builtin_alias(words: &[String]) -> i32 {
     } else {
         ""
     };
-    let table = || with_shell(|s| s.assoc(table_name).cloned().unwrap_or_default());
-    let show = |k: &str, v: &str| -> String {
-        if list_cmd {
+    // Without -g, -r or -s a listing or lookup covers regular and global
+    // aliases together, as zsh's one alias table does.
+    let both = !suffix && global == regular;
+    let listed = |lookup: bool| -> Vec<(String, String, &'static str)> {
+        let of = |t: &str, f: &'static str| -> Vec<(String, String, &'static str)> {
+            with_shell(|s| s.assoc(t).cloned().unwrap_or_default())
+                .into_iter()
+                .map(|(k, v)| (k, v, f))
+                .collect()
+        };
+        // A name is looked up among both kinds even with -g or -r.
+        if both || (lookup && !suffix) {
+            let mut all = of(crate::types::ALIASES, "");
+            all.extend(of(crate::types::GALIASES, "-g "));
+            all.sort();
+            all
+        } else {
+            of(table_name, flag)
+        }
+    };
+    let show = |k: &str, v: &str, flag: &str| -> String {
+        if names_only {
+            format!("{}\n", k)
+        } else if list_cmd {
             format!(
                 "alias {}{}={}\n",
                 flag,
@@ -2599,11 +2660,11 @@ fn builtin_alias(words: &[String]) -> i32 {
         }
     };
     if args.is_empty() || pattern {
-        let all = table();
+        let all = listed(false);
         let text: String = all
             .iter()
-            .filter(|(k, _)| args.is_empty() || args.iter().any(|p| crate::pattern::matches(p, k)))
-            .filter(|(k, _)| {
+            .filter(|(k, ..)| args.is_empty() || args.iter().any(|p| crate::pattern::matches(p, k)))
+            .filter(|(k, ..)| {
                 // `alias -L` output is read back as commands, which a name
                 // containing `=` would not survive.
                 let bad = list_cmd && k.contains('=');
@@ -2615,7 +2676,7 @@ fn builtin_alias(words: &[String]) -> i32 {
                 }
                 !bad
             })
-            .map(|(k, v)| show(k, v))
+            .map(|(k, v, f)| show(k, v, f))
             .collect();
         out(&text);
         return 0;
@@ -2627,9 +2688,12 @@ fn builtin_alias(words: &[String]) -> i32 {
                 let (name, value) = (a[..i].to_string(), a[i + 1..].to_string());
                 with_shell(|s| s.assoc_entry(table_name).insert(name, value));
             }
-            None => match table().get(a.as_str()).cloned() {
-                Some(v) => {
-                    out(&show(a, &v));
+            None => match listed(true).into_iter().find(|(k, ..)| k == a) {
+                // Found, but shown only if it is the kind asked for.
+                Some((_, v, f)) => {
+                    if both || f == flag {
+                        out(&show(a, &v, f));
+                    }
                 }
                 None => {
                     builtin_err("alias", &format!("{}: not found", a));
@@ -4031,6 +4095,8 @@ fn builtin_unlimit(words: &[String]) -> i32 {
 // it, as zsh's `autoload -X` does.
 fn autoload_stub(dir: Option<&str>, default_too: bool) -> String {
     let mut stub = String::from("builtin autoload -X");
+    // The -U, -k and -z given when it was marked go with the function.
+    STUB_FLAGS.with(|f| stub.push_str(&f.borrow()));
     if default_too {
         stub.push_str(" -d");
     }
@@ -4039,6 +4105,13 @@ fn autoload_stub(dir: Option<&str>, default_too: bool) -> String {
         stub.push_str(&shell_quote(d));
     }
     stub
+}
+
+thread_local! {
+    // Flag letters of the `autoload` now marking functions, for their stubs.
+    static STUB_FLAGS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    // `autoload -Xk` / `-Xz`: the style of the load in progress.
+    static KSH_STYLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub fn is_autoload_stub(name: &str) -> bool {
@@ -4110,6 +4183,9 @@ fn fpath_dir(name: &str) -> Option<String> {
 fn builtin_autoload(words: &[String]) -> i32 {
     let (mut load_now, mut exec_now, mut default_too) = (false, false, false);
     let (mut resolve, mut strict) = (false, false);
+    // -k / -z: load ksh style or zsh style whatever KSH_AUTOLOAD says.
+    let mut ksh_style: Option<bool> = None;
+    let mut no_alias = false;
     let mut i = 1;
     while let Some(a) = words.get(i) {
         if a == "+X" {
@@ -4118,6 +4194,9 @@ fn builtin_autoload(words: &[String]) -> i32 {
             for c in f.chars() {
                 match c {
                     'X' => exec_now = true,
+                    'k' => ksh_style = Some(true),
+                    'z' => ksh_style = Some(false),
+                    'U' => no_alias = true,
                     'd' => default_too = true,
                     'r' => resolve = true,
                     'R' => {
@@ -4134,8 +4213,35 @@ fn builtin_autoload(words: &[String]) -> i32 {
     }
     let args = &words[i..];
     if exec_now {
-        return autoload_exec(args.first().map(|s| s.as_str()), default_too);
+        // -X replaces the function that is running: there must be one.
+        if with_shell(|s| s.func_depth) == 0 {
+            builtin_err("autoload", "bad option(s)");
+            return 1;
+        }
+        return autoload_exec(args.first().map(|s| s.as_str()), default_too, ksh_style);
     }
+    let mut stub_flags = String::new();
+    if no_alias {
+        stub_flags.push('U');
+    }
+    match ksh_style {
+        Some(true) => stub_flags.push('k'),
+        Some(false) => stub_flags.push('z'),
+        None => {}
+    }
+    STUB_FLAGS.with(|f| *f.borrow_mut() = stub_flags);
+    let status = autoload_mark(args, load_now, default_too, resolve, strict);
+    STUB_FLAGS.with(|f| f.borrow_mut().clear());
+    status
+}
+
+fn autoload_mark(
+    args: &[String],
+    load_now: bool,
+    default_too: bool,
+    resolve: bool,
+    strict: bool,
+) -> i32 {
     let mut status = 0;
     for arg in args {
         // `autoload /dir/name`: name loads from dir.
@@ -4183,9 +4289,12 @@ fn builtin_autoload(words: &[String]) -> i32 {
 
 // `autoload -X [dir]` in a function: loads the running function's
 // definition, replacing it, and runs it with the same arguments.
-fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
+fn autoload_exec(dir: Option<&str>, default_too: bool, ksh_style: Option<bool>) -> i32 {
     let (name, args) = with_shell(|s| (s.argv0.clone(), s.pos_params.clone()));
-    if !autoload_now(&name, dir, default_too || dir.is_none()) {
+    KSH_STYLE.with(|k| k.set(ksh_style));
+    let loaded = autoload_now(&name, dir, default_too || dir.is_none());
+    KSH_STYLE.with(|k| k.set(None));
+    if !loaded {
         // A file that did not parse has been reported already.
         if AUTOLOAD_PARSE_FAILED.with(|f| f.replace(false)) {
             return 1;
@@ -4239,7 +4348,7 @@ fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
     let saved = with_shell(|s| std::mem::replace(&mut s.source_file, origin));
     let mut words = vec![name.clone()];
     words.extend(args);
-    let st = if crate::options::is_set("kshautoload") {
+    let st = if ksh_style.unwrap_or_else(|| crate::options::is_set("kshautoload")) {
         // KSH_AUTOLOAD: the file is run, and should define the function,
         // which is then called.
         crate::exec::exec_node(&body);
@@ -4305,7 +4414,9 @@ fn autoload_now(name: &str, dir: Option<&str>, fpath_too: bool) -> bool {
             return false;
         }
     };
-    let ksh = crate::options::is_set("kshautoload");
+    let ksh = KSH_STYLE
+        .with(|k| k.get())
+        .unwrap_or_else(|| crate::options::is_set("kshautoload"));
     let body = match nodes.as_slice() {
         [Node::FuncDef { name: n, body, .. }] if n == name && !ksh => (**body).clone(),
         _ => Node::List(
@@ -4388,6 +4499,26 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
     }
     let mut status = 0;
     let mut i = 0;
+    // -m: the arguments are patterns; every option whose name matches is
+    // set (or unset).
+    if args[0] == "-m" {
+        for pat in &args[1..] {
+            let pat: String = pat
+                .chars()
+                .filter(|&c| c != '_')
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            let matched: Vec<&str> = crate::options::names()
+                .filter(|o| crate::pattern::matches(&pat, o))
+                .collect();
+            for o in matched {
+                if crate::options::refused(o, value).is_none() {
+                    crate::options::set(o, value);
+                }
+            }
+        }
+        return 0;
+    }
     while i < args.len() {
         let arg = &args[i];
         if arg == "-o" || arg == "+o" {

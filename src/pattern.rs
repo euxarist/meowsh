@@ -1197,6 +1197,10 @@ impl Pattern {
                         }
                         n -= 1;
                         if fl.global {
+                            // zsh stops before the end: no empty match there.
+                            if mpos == t && t == len && len > 0 {
+                                break;
+                            }
                             if mpos > t || chunks.last().is_none_or(|c| c.1 != t) {
                                 chunks.push((t, mpos));
                             }

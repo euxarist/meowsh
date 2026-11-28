@@ -47,7 +47,17 @@ impl std::fmt::Display for Num {
             Num::F(x) if x.is_nan() => write!(f, "NaN"),
             Num::F(x) if x.is_infinite() => write!(f, "{}", if *x < 0.0 { "-Inf" } else { "Inf" }),
             Num::F(x) => {
-                let s = format!("{}", x);
+                // zsh's convfloat: 17 significant digits, `%g` style.
+                let mut buf = [0u8; 64];
+                let n = unsafe {
+                    libc::snprintf(
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len(),
+                        c"%.17g".as_ptr(),
+                        *x,
+                    )
+                };
+                let s = String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(63)]).into_owned();
                 if x.is_finite() && !s.contains('.') && !s.contains('e') {
                     write!(f, "{}.", s)
                 } else {
@@ -127,14 +137,35 @@ fn parse_value(s: &str) -> Result<Num, String> {
 fn scan_number(c: &[char], n: usize) -> Result<(Num, usize), String> {
     let digit = |i: usize, base: u32| c.get(i).and_then(|x| x.to_digit(36)).filter(|&d| d < base);
     let int_run = |i: &mut usize, base: u32| -> i64 {
-        let mut v: i64 = 0;
+        // zsh's zstrtol: a number too big for 64 bits (or reaching the
+        // sign bit) loses its last digits, with a warning.
+        let start = *i;
+        let mut v: u64 = 0;
+        let mut kept: Option<usize> = None;
         while *i < c.len() && (c[*i] == '_' || digit(*i, base).is_some()) {
-            if let Some(d) = digit(*i, base) {
-                v = v.wrapping_mul(base as i64).wrapping_add(d as i64);
+            if let (Some(d), None) = (digit(*i, base), kept) {
+                match v
+                    .checked_mul(base as u64)
+                    .and_then(|x| x.checked_add(d as u64))
+                {
+                    Some(x) => v = x,
+                    None => kept = Some(*i - start),
+                }
             }
             *i += 1;
         }
-        v
+        if kept.is_none() && (v as i64) < 0 {
+            kept = Some(*i - start - 1);
+            v /= base as u64;
+        }
+        if let Some(digits) = kept {
+            crate::shell::shell_err(&format!(
+                "number truncated after {} digits: {}",
+                digits,
+                c[start..].iter().collect::<String>()
+            ));
+        }
+        v as i64
     };
     let dec = |i: usize| c.get(i).is_some_and(|x| x.is_ascii_digit() || *x == '_');
     if c[n] == '0' {
@@ -470,7 +501,10 @@ fn int_binop(op: &str, l: i64, r: i64) -> Result<i64, String> {
 }
 
 fn binop(op: &str, l: Num, r: Num) -> R {
-    let either_float = matches!(l, Num::F(_)) || matches!(r, Num::F(_));
+    // An integer to a negative power is a real number, as in zsh.
+    let either_float = matches!(l, Num::F(_))
+        || matches!(r, Num::F(_))
+        || (op == "**" && matches!(r, Num::I(n) if n < 0));
     // Bitwise operators always work on integers.
     if !either_float || matches!(op, "<<" | ">>" | "&" | "^" | "|") {
         return int_binop(op, l.as_int(), r.as_int()).map(Num::I);

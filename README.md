@@ -95,7 +95,9 @@ and builtins include:
 - `whence` (`-v`, `-c`, `-w`, `-a`, `-p`, `-m`, `-s`, `-S`), `which`,
   `where`, `type`
 - patterns and globs with `(a|b)` groups and `<n-m>` ranges, `**/`, and
-  glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(D)`
+  glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(L+1k)`,
+  `(D)`, with `-` to follow symbolic links; matches sort in the locale's
+  collation order
 - `[[ x == (a|b)* ]]`, `[[ -v name[key] ]]`, `[[ -o option ]]`
 - `=(cmd)` (output in a temporary file), `=cmd` (the command's path),
   glob qualifier modifiers (`*(:t)`), `a~b` exclusions on whole paths,
@@ -125,7 +127,8 @@ and builtins include:
   `function { ... } args`, `command_not_found_handler`, `$FUNCNEST`, `$argv`,
   `print`, `emulate`, `is-at-least`,
   `zparseopts`, `fc -l`, `fc -W`/`-A`/`-R` (zsh's history file format), `fc -p`/`-P`,
-  `print -s`, `HIST_IGNORE_SPACE`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`,
+  `print -s`, `HIST_IGNORE_SPACE`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`
+  (from the terminal, or `-u fd`),
   global aliases (`alias -g`) and the `$aliases`/`$galiases` arrays
 - function-scoped EXIT traps, `LOCAL_OPTIONS`/`LOCAL_TRAPS` (also set by
   `emulate -L`), `AUTO_CD`, `$0` as the function or sourced file name
